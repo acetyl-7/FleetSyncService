@@ -61,6 +61,18 @@ public class Worker : BackgroundService
                 }
                 _logger.LogInformation("Sincronização concluída: {Count} motoristas processados para SQL.", syncedCount);
 
+                // Sincronização Inversa (Firebase -> SQL) via Delta Sync
+                var pendingTasks = await _firebaseService.GetTasksPendingSqlSyncAsync();
+                foreach (var task in pendingTasks)
+                {
+                    var success = await _sqlService.ExecuteTaskStatusProcedureAsync(task);
+                    if (success)
+                    {
+                        await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
+                        _logger.LogInformation("Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
+                    }
+                }
+
                 // Sincronização de Tarefas (SQL -> Firebase)
                 var activeTasks = await _sqlService.GetActiveTasksAsync();
                 foreach (var task in activeTasks)

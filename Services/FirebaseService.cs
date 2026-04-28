@@ -15,6 +15,8 @@ public interface IFirebaseService
     Task<IEnumerable<DriverFirebaseModel>> GetAllFirebaseUsersAsync();
     Task UpdateDriverSqlIdAsync(string uid, string generatedSqlId);
     Task UpdateDriverIdAsync(string uid, string driverId);
+    Task<List<TaskModel>> GetTasksPendingSqlSyncAsync();
+    Task MarkTaskAsSyncedAsync(string firebaseTaskId);
 }
 
 public class FirebaseService : IFirebaseService
@@ -225,5 +227,46 @@ public class FirebaseService : IFirebaseService
         var docRef = _db.Collection("users").Document(uid);
         var data = new Dictionary<string, object> { { "driverId", driverId } };
         await docRef.SetAsync(data, SetOptions.MergeAll);
+    }
+
+    public async Task<List<TaskModel>> GetTasksPendingSqlSyncAsync()
+    {
+        var snapshot = await _db.Collection("tasks")
+            .WhereEqualTo("needsSqlSync", true)
+            .GetSnapshotAsync();
+
+        var list = new List<TaskModel>();
+        foreach (var doc in snapshot.Documents)
+        {
+            if (!doc.Exists) continue;
+
+            DateTime? statusDate = null;
+            if (doc.ContainsField("statusDate"))
+            {
+                statusDate = doc.GetValue<Timestamp>("statusDate").ToDateTime().ToLocalTime();
+            }
+            else if (doc.ContainsField("completedAt"))
+            {
+                statusDate = doc.GetValue<Timestamp>("completedAt").ToDateTime().ToLocalTime();
+            }
+
+            list.Add(new TaskModel
+            {
+                Id = doc.Id,
+                SqlId = doc.ContainsField("sqlId") ? doc.GetValue<string>("sqlId") : string.Empty,
+                Status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty,
+                StatusDate = statusDate,
+                Lat = doc.ContainsField("lat") ? doc.GetValue<double>("lat") : null,
+                Lon = doc.ContainsField("lon") ? doc.GetValue<double>("lon") : null,
+                NeedsSqlSync = true
+            });
+        }
+        return list;
+    }
+
+    public async Task MarkTaskAsSyncedAsync(string firebaseTaskId)
+    {
+        var docRef = _db.Collection("tasks").Document(firebaseTaskId);
+        await docRef.SetAsync(new Dictionary<string, object> { { "needsSqlSync", false } }, SetOptions.MergeAll);
     }
 }

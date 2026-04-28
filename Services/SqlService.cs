@@ -3,6 +3,8 @@ using FleetSyncService.Models;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 using Dapper;
+using System.Data;
+using Microsoft.Extensions.Logging;
 
 namespace FleetSyncService.Services;
 
@@ -18,16 +20,19 @@ public interface ISqlService
     Task CreateNewMotoristaFromFirebaseAsync(string email, string nickname, string firebaseUid);
     Task<MotoristaValidationResult?> ValidateCompanyPhoneAsync(string phoneNumber);
     Task RegisterDriverAsync(string firebaseUid, string email, string phoneNumber, string nickName, int fleetcomDriverId);
+    Task<bool> ExecuteTaskStatusProcedureAsync(TaskModel firebaseTask);
 }
 
 public class SqlService : ISqlService
 {
     private readonly string _connectionString;
+    private readonly ILogger<SqlService> _logger;
 
-    public SqlService(IOptions<DatabaseConfig> config)
+    public SqlService(IOptions<DatabaseConfig> config, ILogger<SqlService> logger)
     {
         _connectionString = config.Value.ConnectionString 
             ?? throw new InvalidOperationException("SQL Connection String is not configured in appsettings.json.");
+        _logger = logger;
     }
 
     public async Task ExecuteSqlAsync(string sql)
@@ -218,6 +223,49 @@ public class SqlService : ISqlService
         }
 
         return result;
+    }
+
+    private int TraduzirEstadoParaSql(string firebaseStatus)
+    {
+        return firebaseStatus?.ToLower() switch
+        {
+            "enviada" => 10,
+            "recebida" => 20,
+            "vista" => 30,
+            "iniciada" => 40,
+            "terminada" => 80,
+            "completed" => 80, // fallback
+            "anulada" => 90,
+            _ => 10 // default
+        };
+    }
+
+    public async Task<bool> ExecuteTaskStatusProcedureAsync(TaskModel firebaseTask)
+    {
+        var parameters = new DynamicParameters();
+        // O SQL precisa de um Guid. Se falhar o parse, a tarefa não deve ser processada.
+        if (!Guid.TryParse(firebaseTask.SqlId, out Guid uidTask)) return false; 
+
+        parameters.Add("@UID_TASK", uidTask);
+        parameters.Add("@STATUS", TraduzirEstadoParaSql(firebaseTask.Status));
+        parameters.Add("@DATA_USER", firebaseTask.StatusDate ?? DateTime.UtcNow);
+        parameters.Add("@DATA_SISTEMA", DateTime.UtcNow);
+        parameters.Add("@LAT", firebaseTask.Lat); 
+        parameters.Add("@LON", firebaseTask.Lon); 
+        parameters.Add("@CITY", null); 
+        parameters.Add("@FREE_SPACE", null);
+        parameters.Add("@TEMPERATURA", null);
+        parameters.Add("@DURATION", null);
+        parameters.Add("@LOCATION", null);
+
+        try {
+            using var connection = new SqlConnection(_connectionString);
+            await connection.ExecuteAsync("dbo.PROCESSA_TASK_STATUS", parameters, commandType: CommandType.StoredProcedure);
+            return true;
+        } catch (Exception ex) {
+            _logger.LogError(ex, "Erro a executar SP para a tarefa {Id}", firebaseTask.Id);
+            return false;
+        }
     }
 
     /// <summary>
