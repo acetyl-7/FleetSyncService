@@ -18,6 +18,9 @@ public class TaskSqlModel
     public double? Lon { get; set; }
     public DateTime? Date { get; set; }
     public string Status { get; set; } = string.Empty;
+    public string Ref { get; set; } = string.Empty;
+    public string Obs { get; set; } = string.Empty;
     public DateTime? LastUpdated { get; set; }
     public bool Deleted { get; set; }
+    public string TaskTypeName { get; set; } = string.Empty;
 }

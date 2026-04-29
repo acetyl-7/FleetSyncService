@@ -55,15 +55,18 @@ public class SqlService : ISqlService
         // Vamos buscar as tarefas que não estejam apagadas e que não estejam concluídas
         var query = @"
             SELECT 
-                id, fleetcomTaskOrder, fleetcomTaskId, fleetcomDriverId, 
-                fleetcomTractorId, fleetcomTrailerId, fleetcomTaskTypeId,
-                tractorPlate, trailerPlate, city, address, country, lat, lon, 
-                CAST(date AS DATETIME2) AS date, 
-                CAST(status AS VARCHAR(10)) AS status, 
-                CAST(lastUpdated AS DATETIME2) AS lastUpdated, 
-                CAST(CASE WHEN deleted IS NULL THEN 0 ELSE 1 END AS BIT) AS deleted 
-            FROM dbo.task 
-            WHERE deleted IS NULL AND status != 3";
+                t.id, t.fleetcomTaskOrder, t.fleetcomTaskId, t.fleetcomDriverId, 
+                t.fleetcomTractorId, t.fleetcomTrailerId, t.fleetcomTaskTypeId,
+                t.tractorPlate, t.trailerPlate, t.city, t.address, t.country, t.lat, t.lon, 
+                t.[ref], t.obs,
+                CAST(t.date AS DATETIME2) AS date, 
+                CAST(t.status AS VARCHAR(10)) AS status, 
+                CAST(t.lastUpdated AS DATETIME2) AS lastUpdated, 
+                CAST(CASE WHEN t.deleted IS NULL THEN 0 ELSE 1 END AS BIT) AS deleted,
+                ISNULL(tt.fleetcomName, '') AS taskTypeName
+            FROM dbo.task t
+            LEFT JOIN dbo.task_type tt ON t.fleetcomTaskTypeId = tt.fleetcomId
+            WHERE t.deleted IS NULL AND t.status < 80";
         return await connection.QueryAsync<TaskSqlModel>(query);
     }
 
@@ -165,29 +168,31 @@ public class SqlService : ISqlService
         return id.HasValue;
     }
 
-    public async Task LinkFirebaseUserToSqlAsync(string email, string firebaseUid)
+    public Task LinkFirebaseUserToSqlAsync(string email, string firebaseUid)
     {
-        using var connection = new SqlConnection(_connectionString);
-        var query = @"
-            UPDATE dbo.v_motorista_todos 
-            SET FIREBASE_UID = @FirebaseUid
-            WHERE EMAIL = @Email";
+        // using var connection = new SqlConnection(_connectionString);
+        // var query = @"
+        //     UPDATE dbo.v_motorista_todos 
+        //     SET FIREBASE_UID = @FirebaseUid
+        //     WHERE EMAIL = @Email";
             
-       // await connection.ExecuteAsync(query, new { Email = email, FirebaseUid = firebaseUid });
+        // await connection.ExecuteAsync(query, new { Email = email, FirebaseUid = firebaseUid });
+        return Task.CompletedTask;
     }
 
-     public async Task CreateNewMotoristaFromFirebaseAsync(string email, string nickname, string firebaseUid)
+    public Task CreateNewMotoristaFromFirebaseAsync(string email, string nickname, string firebaseUid)
     {
-        using var connection = new SqlConnection(_connectionString);
-        var insertQuery = @"
-            INSERT INTO dbo.v_motorista_todos (ID_EMPRESA, NOME, ALCUNHA, EMAIL, FIREBASE_UID, ID_CENTRO_CUSTO) 
-            VALUES (1, @Nickname, @Nickname, @Email, @FirebaseUid, 3)";
+        // using var connection = new SqlConnection(_connectionString);
+        // var insertQuery = @"
+        //     INSERT INTO dbo.v_motorista_todos (ID_EMPRESA, NOME, ALCUNHA, EMAIL, FIREBASE_UID, ID_CENTRO_CUSTO) 
+        //     VALUES (1, @Nickname, @Nickname, @Email, @FirebaseUid, 3)";
             
         /*await connection.ExecuteAsync(insertQuery, new { 
             Nickname = nickname, 
             Email = email, 
             FirebaseUid = firebaseUid 
         });*/
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -229,51 +234,27 @@ public class SqlService : ISqlService
     {
         return firebaseStatus?.ToLower() switch
         {
+            "pending" or "por_enviar" => 1,
             "enviada" => 10,
             "recebida" => 20,
             "vista" => 30,
-            "iniciada" => 40,
-            "terminada" => 80,
-            "completed" => 80, // fallback
+            "in_progress" or "iniciada" => 40,
+            "terminada" or "completed" => 80,
             "anulada" => 90,
-            _ => 10 // default
+            _ => 1 // Default para Por Enviar
         };
     }
 
-    public async Task<bool> ExecuteTaskStatusProcedureAsync(TaskModel firebaseTask)
-    {
-        var parameters = new DynamicParameters();
-        // O SQL precisa de um Guid. Se falhar o parse, a tarefa não deve ser processada.
-        if (!Guid.TryParse(firebaseTask.SqlId, out Guid uidTask)) return false; 
-
-        parameters.Add("@UID_TASK", uidTask);
-        parameters.Add("@STATUS", TraduzirEstadoParaSql(firebaseTask.Status));
-        parameters.Add("@DATA_USER", firebaseTask.StatusDate ?? DateTime.UtcNow);
-        parameters.Add("@DATA_SISTEMA", DateTime.UtcNow);
-        parameters.Add("@LAT", firebaseTask.Lat); 
-        parameters.Add("@LON", firebaseTask.Lon); 
-        parameters.Add("@CITY", null); 
-        parameters.Add("@FREE_SPACE", null);
-        parameters.Add("@TEMPERATURA", null);
-        parameters.Add("@DURATION", null);
-        parameters.Add("@LOCATION", null);
-
-        try {
-            using var connection = new SqlConnection(_connectionString);
-            await connection.ExecuteAsync("dbo.PROCESSA_TASK_STATUS", parameters, commandType: CommandType.StoredProcedure);
-            return true;
-        } catch (Exception ex) {
-            _logger.LogError(ex, "Erro a executar SP para a tarefa {Id}", firebaseTask.Id);
-            return false;
-        }
-    }
 
     /// <summary>
     /// Insere um novo driver na tabela dbo.driver após registo bem-sucedido
     /// </summary>
     public async Task RegisterDriverAsync(string firebaseUid, string email, string phoneNumber, string nickName, int fleetcomDriverId)
     {
-        Console.WriteLine($"[DEBUG] A registar driver no SQL: {email} (Firebase UID: {firebaseUid})");
+        // Gerar loginCode único baseado no fleetcomDriverId
+        var loginCode = fleetcomDriverId.ToString().PadLeft(4, '0');
+        
+        Console.WriteLine($"[DEBUG] A registar driver no SQL: {email} (Firebase UID: {firebaseUid}, LoginCode: {loginCode})");
         
         using var connection = new SqlConnection(_connectionString);
         
@@ -284,7 +265,7 @@ public class SqlService : ISqlService
             ON target.firebaseUid = source.firebaseUid
             WHEN MATCHED THEN
                 UPDATE SET 
-                    loginCode = '1234',
+                    loginCode = @LoginCode,
                     active = 1,
                     nickName = @NickName,
                     email = @Email,
@@ -295,12 +276,13 @@ public class SqlService : ISqlService
                     role = 'motorista'
             WHEN NOT MATCHED THEN
                 INSERT (id, firebaseUid, loginCode, active, nickName, email, login, password, phoneNumber, fleetcomDriverId, role)
-                VALUES (NEWID(), @FirebaseUid, '1234', 1, @NickName, @Email, NULL, NULL, @PhoneNumber, @FleetcomDriverId, 'motorista');";
+                VALUES (NEWID(), @FirebaseUid, @LoginCode, 1, @NickName, @Email, NULL, NULL, @PhoneNumber, @FleetcomDriverId, 'motorista');";
 
         try 
         {
             await connection.ExecuteAsync(query, new {
                 FirebaseUid = firebaseUid,
+                LoginCode = loginCode,
                 NickName = nickName,
                 Email = email,
                 PhoneNumber = phoneNumber,
@@ -311,7 +293,94 @@ public class SqlService : ISqlService
         catch (Exception ex)
         {
             Console.WriteLine($"[ERRO SQL] Falha ao registar/atualizar driver: {ex.Message}");
-            throw; // Re-throw para o controller apanhar
+            throw;
+        }
+    }
+
+    public async Task<bool> ExecuteTaskStatusProcedureAsync(TaskModel firebaseTask)
+    {
+        if (string.IsNullOrEmpty(firebaseTask.SqlId) || !Guid.TryParse(firebaseTask.SqlId, out var taskGuid))
+        {
+            _logger.LogWarning("Tarefa {Id} tem SqlId inválido: {SqlId}", firebaseTask.Id, firebaseTask.SqlId);
+            return false;
+        }
+
+        int progressStatus = TraduzirEstadoParaSql(firebaseTask.Status);
+        var agora = DateTime.Now;
+        var dataUser = firebaseTask.StatusDate ?? agora;
+
+        using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        try
+        {
+            // 1. Verificar status atual para evitar erros de Trigger reais
+            var currentStatus = await connection.QueryFirstOrDefaultAsync<int?>(
+                "SELECT status FROM dbo.task WHERE id = @Id", new { Id = taskGuid });
+
+            // Só ignoramos se o estado na BD for literalmente maior que o progresso (ex: já está 80 e app envia 40)
+            if (currentStatus.HasValue && currentStatus.Value > progressStatus && currentStatus.Value <= 90)
+            {
+                _logger.LogWarning("Ignorada atualização de status para {SqlId}: Atual={Current}, Novo={New}. (Trigger impediria)", 
+                    firebaseTask.SqlId, currentStatus.Value, progressStatus);
+                return true; 
+            }
+
+            // Se por causa do erro anterior a tarefa ficou com 2638/2639, permitimos a correção
+            // 2. Atualizar o status de progresso diretamente na dbo.task
+            await connection.ExecuteAsync(
+                "UPDATE dbo.task SET status = @Status, statusDate = @StatusDate, clientLastUpdated = @Now WHERE id = @Id",
+                new { Status = progressStatus, StatusDate = dataUser, Now = agora, Id = taskGuid }
+            );
+            _logger.LogInformation("dbo.task atualizada: {SqlId} → status={ProgressStatus}", firebaseTask.SqlId, progressStatus);
+
+            // 3. Inserir manualmente na dbo.task_status (bypassing a SP para evitar que o UPDATE dela corrompa o status)
+            if (firebaseTask.FleetcomTaskTypeId.HasValue)
+            {
+                int externalStatusId = firebaseTask.FleetcomTaskTypeId.Value switch {
+                    2 => 2638,
+                    3 => 2639,
+                    _ => firebaseTask.FleetcomTaskTypeId.Value 
+                };
+
+                string insertTaskStatusSql = @"
+                    DECLARE @UID_TASK_STATUS uniqueidentifier = NEWID();
+
+                    INSERT INTO dbo.task_status (
+                        id, taskId, fleetcomFreightId, fleetcomTaskId, fleetcomDriverId, 
+                        fleetcomTractorId, fleetcomTrailerId, tractorPlate, trailerPlate, 
+                        date, status, statusDescription, freeSpace, lat, lon, 
+                        clientLastUpdated, fleecomRecordStatus
+                    )
+                    SELECT 
+                        @UID_TASK_STATUS, @UID_TASK, TASK.fleetcomFreightId, TASK.fleetcomTaskId, TASK.fleetcomDriverId, 
+                        TASK.fleetcomTractorId, TASK.fleetcomTrailerId, TASK.tractorPlate, TASK.trailerPlate, 
+                        @DATA_USER, @STATUS, v_GF_TIPO_PARAGEM.NOME_EXTERNO, @FREE_SPACE, @LAT, @LON, 
+                        @DATA_SISTEMA, v_GF_TIPO_PARAGEM.ID
+                    FROM task
+                    INNER JOIN v_GF_TIPO_PARAGEM ON v_GF_TIPO_PARAGEM.ID_EXTERNO = @STATUS
+                    WHERE task.ID = @UID_TASK;
+                ";
+
+                await connection.ExecuteAsync(insertTaskStatusSql, new {
+                    UID_TASK = taskGuid,
+                    STATUS = externalStatusId,
+                    DATA_USER = dataUser,
+                    DATA_SISTEMA = agora,
+                    LAT = firebaseTask.Lat ?? 0.0,
+                    LON = firebaseTask.Lon ?? 0.0,
+                    FREE_SPACE = 0
+                });
+                
+                _logger.LogInformation("Registo inserido em dbo.task_status manualmente: {SqlId}.", firebaseTask.SqlId);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao sincronizar tarefa {SqlId} para SQL.", firebaseTask.SqlId);
+            return false;
         }
     }
 }

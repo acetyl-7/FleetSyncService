@@ -63,15 +63,24 @@ public class Worker : BackgroundService
 
                 // Sincronização Inversa (Firebase -> SQL) via Delta Sync
                 var pendingTasks = await _firebaseService.GetTasksPendingSqlSyncAsync();
+                _logger.LogInformation("Tarefas pendentes de sync Firebase->SQL: {Count}", pendingTasks.Count);
                 foreach (var task in pendingTasks)
                 {
+                    _logger.LogInformation("A processar tarefa pendente: Firebase={Id}, SqlId={SqlId}, Status={Status}", task.Id, task.SqlId, task.Status);
                     var success = await _sqlService.ExecuteTaskStatusProcedureAsync(task);
                     if (success)
                     {
                         await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
                         _logger.LogInformation("Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
                     }
+                    else
+                    {
+                        _logger.LogWarning("Falha ao sincronizar tarefa {TaskId} para o SQL Server.", task.Id);
+                    }
                 }
+
+                _logger.LogInformation("A aguardar que a base de dados processe os logs antes de iniciar sync SQL -> Firebase...");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
                 // Sincronização de Tarefas (SQL -> Firebase)
                 var activeTasks = await _sqlService.GetActiveTasksAsync();

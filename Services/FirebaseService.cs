@@ -85,10 +85,14 @@ public class FirebaseService : IFirebaseService
         // O Tradutor Inverso: Converte o número do SQL para a palavra do Firebase
         string firebaseStatus = sqlTask.Status?.ToString() switch
         {
-            "1" => "pending",
-            "2" => "in_progress",
-            "3" => "completed",
-            _ => "pending" // Default
+            "0" => "por_enviar",
+            "10" => "enviada",
+            "20" => "recebida",
+            "30" => "vista",
+            "40" => "iniciada",
+            "80" => "terminada",
+            "90" => "anulada",
+            _ => "por_enviar"
         };
 
         var taskData = new Dictionary<string, object?>
@@ -100,6 +104,9 @@ public class FirebaseService : IFirebaseService
             { "city", sqlTask.City ?? "" },
             { "address", sqlTask.Address ?? "" },
             { "country", sqlTask.Country ?? "" },
+            { "ref", sqlTask.Ref ?? "" },
+            { "obs", sqlTask.Obs ?? "" },
+            { "taskTypeName", sqlTask.TaskTypeName ?? "" },
             { "driverId", sqlTask.FleetcomDriverId?.ToString() ?? "" },
             { "fleetcomTaskOrder", sqlTask.FleetcomTaskOrder },
             { "fleetcomTaskId", sqlTask.FleetcomTaskId },
@@ -112,7 +119,16 @@ public class FirebaseService : IFirebaseService
         // Remove valores nulos para não sujar o Firebase
         var cleanData = taskData.Where(kv => kv.Value != null).ToDictionary(kv => kv.Key, kv => kv.Value);
 
-        await _db.Collection("tasks").Document(sqlTask.Id.ToString()).SetAsync(cleanData, SetOptions.Overwrite);
+        var docRef = _db.Collection("tasks").Document(sqlTask.Id.ToString());
+        var snapshot = await docRef.GetSnapshotAsync();
+
+        // Se a tarefa já existir e estiver pendente de sync, não atualizamos o estado para evitar atropelos
+        if (snapshot.Exists && snapshot.ContainsField("needsSqlSync") && snapshot.GetValue<bool>("needsSqlSync") == true)
+        {
+            cleanData.Remove("status");
+        }
+
+        await docRef.SetAsync(cleanData, SetOptions.MergeAll);
     }
 
     public void StartTasksListener(Func<Guid, string, DateTime, Task> onTaskUpdatedCallback, ILogger logger)
@@ -231,34 +247,62 @@ public class FirebaseService : IFirebaseService
 
     public async Task<List<TaskModel>> GetTasksPendingSqlSyncAsync()
     {
-        var snapshot = await _db.Collection("tasks")
-            .WhereEqualTo("needsSqlSync", true)
-            .GetSnapshotAsync();
+        // Filtramos em memória para evitar necessidade de índice composto no Firestore
+        var snapshot = await _db.Collection("tasks").GetSnapshotAsync();
 
         var list = new List<TaskModel>();
         foreach (var doc in snapshot.Documents)
         {
             if (!doc.Exists) continue;
 
+            // Verificar needsSqlSync (pode ser bool ou string)
+            bool needsSync = false;
+            if (doc.ContainsField("needsSqlSync"))
+            {
+                var rawVal = doc.GetValue<object>("needsSqlSync");
+                needsSync = rawVal is bool b ? b : rawVal?.ToString()?.ToLower() == "true";
+            }
+            if (!needsSync) continue;
+
             DateTime? statusDate = null;
             if (doc.ContainsField("statusDate"))
-            {
                 statusDate = doc.GetValue<Timestamp>("statusDate").ToDateTime().ToLocalTime();
-            }
+            else if (doc.ContainsField("startedAt"))
+                statusDate = doc.GetValue<Timestamp>("startedAt").ToDateTime().ToLocalTime();
             else if (doc.ContainsField("completedAt"))
-            {
                 statusDate = doc.GetValue<Timestamp>("completedAt").ToDateTime().ToLocalTime();
+
+            double? lat = null;
+            double? lon = null;
+            var status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty;
+
+            if (doc.ContainsField("startLocation"))
+            {
+                var gp = doc.GetValue<GeoPoint>("startLocation");
+                lat = gp.Latitude;
+                lon = gp.Longitude;
             }
+            if (doc.ContainsField("completeLocation"))
+            {
+                var gp = doc.GetValue<GeoPoint>("completeLocation");
+                lat = gp.Latitude;
+                lon = gp.Longitude;
+            }
+            if (lat == null && doc.ContainsField("lat"))
+                lat = doc.GetValue<double>("lat");
+            if (lon == null && doc.ContainsField("lon"))
+                lon = doc.GetValue<double>("lon");
 
             list.Add(new TaskModel
             {
                 Id = doc.Id,
                 SqlId = doc.ContainsField("sqlId") ? doc.GetValue<string>("sqlId") : string.Empty,
-                Status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty,
+                Status = status,
                 StatusDate = statusDate,
-                Lat = doc.ContainsField("lat") ? doc.GetValue<double>("lat") : null,
-                Lon = doc.ContainsField("lon") ? doc.GetValue<double>("lon") : null,
-                NeedsSqlSync = true
+                Lat = lat,
+                Lon = lon,
+                NeedsSqlSync = true,
+                FleetcomTaskTypeId = doc.ContainsField("fleetcomTaskTypeId") ? (int?)doc.GetValue<long>("fleetcomTaskTypeId") : null
             });
         }
         return list;

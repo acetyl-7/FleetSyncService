@@ -9,4 +9,5 @@ public class TaskModel
     public double? Lat { get; set; }
     public double? Lon { get; set; }
     public bool NeedsSqlSync { get; set; }
+    public int? FleetcomTaskTypeId { get; set; }
 }
