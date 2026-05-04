@@ -150,10 +150,10 @@ public class FirebaseService : IFirebaseService
                     var status = doc.GetValue<string>("status");
 
                     // Tenta extrair a data de conclusão (se existir, senão usa a data atual)
-                    DateTime completedAt = DateTime.Now;
+                    DateTime completedAt = DateTime.UtcNow;
                     if (doc.ContainsField("completedAt"))
                     {
-                        completedAt = doc.GetValue<Timestamp>("completedAt").ToDateTime().ToLocalTime();
+                        completedAt = doc.GetValue<Timestamp>("completedAt").ToDateTime();
                     }
 
                     if (Guid.TryParse(sqlIdStr, out Guid sqlGuid))
@@ -247,30 +247,24 @@ public class FirebaseService : IFirebaseService
 
     public async Task<List<TaskModel>> GetTasksPendingSqlSyncAsync()
     {
-        // Filtramos em memória para evitar necessidade de índice composto no Firestore
-        var snapshot = await _db.Collection("tasks").GetSnapshotAsync();
+        // Utiliza uma query nativa do Firestore para buscar apenas as tarefas pendentes,
+        // reduzindo drasticamente o custo de leitura.
+        var snapshot = await _db.Collection("tasks")
+                                .WhereEqualTo("needsSqlSync", true)
+                                .GetSnapshotAsync();
 
         var list = new List<TaskModel>();
         foreach (var doc in snapshot.Documents)
         {
             if (!doc.Exists) continue;
 
-            // Verificar needsSqlSync (pode ser bool ou string)
-            bool needsSync = false;
-            if (doc.ContainsField("needsSqlSync"))
-            {
-                var rawVal = doc.GetValue<object>("needsSqlSync");
-                needsSync = rawVal is bool b ? b : rawVal?.ToString()?.ToLower() == "true";
-            }
-            if (!needsSync) continue;
-
             DateTime? statusDate = null;
             if (doc.ContainsField("statusDate"))
-                statusDate = doc.GetValue<Timestamp>("statusDate").ToDateTime().ToLocalTime();
+                statusDate = doc.GetValue<Timestamp>("statusDate").ToDateTime();
             else if (doc.ContainsField("startedAt"))
-                statusDate = doc.GetValue<Timestamp>("startedAt").ToDateTime().ToLocalTime();
+                statusDate = doc.GetValue<Timestamp>("startedAt").ToDateTime();
             else if (doc.ContainsField("completedAt"))
-                statusDate = doc.GetValue<Timestamp>("completedAt").ToDateTime().ToLocalTime();
+                statusDate = doc.GetValue<Timestamp>("completedAt").ToDateTime();
 
             double? lat = null;
             double? lon = null;

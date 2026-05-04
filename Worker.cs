@@ -8,6 +8,13 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly IFirebaseService _firebaseService;
     private readonly ISqlService _sqlService;
+    
+    // Controlo de tempo para não correr a sincronização de utilizadores a cada 10 segundos
+    private DateTime _lastUserSyncTime = DateTime.MinValue;
+    private readonly TimeSpan _userSyncInterval = TimeSpan.FromMinutes(5);
+
+    // Cache para evitar envios redundantes SQL -> Firebase
+    private readonly Dictionary<Guid, string> _taskHashCache = new();
 
     public Worker(ILogger<Worker> logger, IFirebaseService firebaseService, ISqlService sqlService)
     {
@@ -18,15 +25,6 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        /*
-        _logger.LogInformation("A iniciar Listener de Tarefas do Firebase...");
-        _firebaseService.StartTasksListener(async (taskId, status, statusDate) =>
-        {
-            await _sqlService.UpdateTaskStatusAsync(taskId, status, statusDate);
-            _logger.LogInformation("SQL atualizado com sucesso para a tarefa {TaskId}", taskId);
-        }, _logger);
-        */
-
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -34,32 +32,37 @@ public class Worker : BackgroundService
                 _logger.LogInformation("Sync Service a correr");
 
                 // 0. Sincronização: Firebase (Firestore) -> SQL (dbo.driver)
-                _logger.LogInformation("A verificar novos utilizadores no Firebase...");
-                var fbUsers = await _firebaseService.GetAllFirebaseUsersAsync();
-                int syncedCount = 0;
-
-                foreach (var fbUser in fbUsers)
+                // Corre apenas de X em X minutos para poupar recursos, já que os motoristas não mudam a toda a hora
+                if (DateTime.UtcNow - _lastUserSyncTime >= _userSyncInterval)
                 {
-                    if (!string.IsNullOrEmpty(fbUser.Phone))
+                    _logger.LogInformation("A verificar novos utilizadores no Firebase...");
+                    var fbUsers = await _firebaseService.GetAllFirebaseUsersAsync();
+                    int syncedCount = 0;
+
+                    foreach (var fbUser in fbUsers)
                     {
-                        var motorista = await _sqlService.ValidateCompanyPhoneAsync(fbUser.Phone);
-                        if (motorista != null)
+                        if (!string.IsNullOrEmpty(fbUser.Phone))
                         {
-                            await _sqlService.RegisterDriverAsync(
-                                fbUser.Uid, 
-                                fbUser.Email, 
-                                motorista.Telemovel, 
-                                motorista.Alcunha, 
-                                motorista.Id
-                            );
-                            // Garante que o documento do utilizador no Firebase tem o driverId para a App Móvel conseguir ler as tarefas
-                            await _firebaseService.UpdateDriverIdAsync(fbUser.Uid, motorista.Id.ToString());
-                            
-                            syncedCount++;
+                            var motorista = await _sqlService.ValidateCompanyPhoneAsync(fbUser.Phone);
+                            if (motorista != null)
+                            {
+                                await _sqlService.RegisterDriverAsync(
+                                    fbUser.Uid, 
+                                    fbUser.Email, 
+                                    motorista.Telemovel, 
+                                    motorista.Alcunha, 
+                                    motorista.Id
+                                );
+                                // Garante que o documento do utilizador no Firebase tem o driverId para a App Móvel conseguir ler as tarefas
+                                await _firebaseService.UpdateDriverIdAsync(fbUser.Uid, motorista.Id.ToString());
+                                
+                                syncedCount++;
+                            }
                         }
                     }
+                    _logger.LogInformation("Sincronização concluída: {Count} motoristas processados para SQL.", syncedCount);
+                    _lastUserSyncTime = DateTime.UtcNow;
                 }
-                _logger.LogInformation("Sincronização concluída: {Count} motoristas processados para SQL.", syncedCount);
 
                 // Sincronização Inversa (Firebase -> SQL) via Delta Sync
                 var pendingTasks = await _firebaseService.GetTasksPendingSqlSyncAsync();
@@ -84,19 +87,31 @@ public class Worker : BackgroundService
 
                 // Sincronização de Tarefas (SQL -> Firebase)
                 var activeTasks = await _sqlService.GetActiveTasksAsync();
+                int updatedTasksCount = 0;
                 foreach (var task in activeTasks)
                 {
-                    await _firebaseService.UpsertTaskAsync(task);
+                    // Gera um hash simples com os campos relevantes para saber se mudou no SQL
+                    var currentHash = $"{task.Status}_{task.TractorPlate}_{task.TrailerPlate}_{task.FleetcomDriverId}_{task.City}_{task.Address}";
+                    
+                    if (!_taskHashCache.TryGetValue(task.Id, out var previousHash) || previousHash != currentHash)
+                    {
+                        await _firebaseService.UpsertTaskAsync(task);
+                        _taskHashCache[task.Id] = currentHash;
+                        updatedTasksCount++;
+                    }
                 }
-                _logger.LogInformation("Sincronizadas {Count} tarefas reais às {Time}", activeTasks.Count(), DateTimeOffset.Now);
+                if (updatedTasksCount > 0)
+                {
+                    _logger.LogInformation("Sincronizadas {Count} tarefas modificadas às {Time}", updatedTasksCount, DateTimeOffset.UtcNow);
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Erro durante o ciclo de sincronização.");
             }
 
-            // Sync every minute as requested
-            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+            // Sync every 10 seconds for tasks
+            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
         }
     }
 }
