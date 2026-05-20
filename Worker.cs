@@ -1,5 +1,6 @@
 using System.Linq;
 using FleetSyncService.Services;
+using FleetSyncService.Models;
 
 namespace FleetSyncService;
 
@@ -15,6 +16,10 @@ public class Worker : BackgroundService
 
     // Cache para evitar envios redundantes SQL -> Firebase
     private readonly Dictionary<Guid, string> _taskHashCache = new();
+
+    // Controlo de tempo para limpar do Firebase as tarefas que foram apagadas ou concluídas no SQL
+    private DateTime _lastTaskCleanupTime = DateTime.MinValue;
+    private readonly TimeSpan _taskCleanupInterval = TimeSpan.FromMinutes(5);
 
     public Worker(ILogger<Worker> logger, IFirebaseService firebaseService, ISqlService sqlService)
     {
@@ -87,6 +92,13 @@ public class Worker : BackgroundService
 
                 // Sincronização de Tarefas (SQL -> Firebase)
                 var activeTasks = await _sqlService.GetActiveTasksAsync();
+                
+                _logger.LogInformation("SQL devolveu {Count} tarefas ativas.", activeTasks.Count());
+                foreach(var t in activeTasks)
+                {
+                    _logger.LogInformation("Ativa no SQL: {Id} com estado {Status}", t.Id, t.Status);
+                }
+
                 int updatedTasksCount = 0;
                 foreach (var task in activeTasks)
                 {
@@ -98,11 +110,153 @@ public class Worker : BackgroundService
                         await _firebaseService.UpsertTaskAsync(task);
                         _taskHashCache[task.Id] = currentHash;
                         updatedTasksCount++;
+
+                        // Se a tarefa acabou de ser enviada para o Firebase e estava no estado "1" (Por Enviar),
+                        // atualizamos de imediato o estado para "10" (Enviada) no SQL para refletir que já chegou ao motorista.
+                        if (task.Status == "1" || task.Status == "0")
+                        {
+                            var updateModel = new TaskModel
+                            {
+                                Id = task.Id.ToString(),
+                                SqlId = task.Id.ToString(),
+                                Status = "enviada", // SqlService traduz para 10
+                                StatusDate = DateTime.UtcNow
+                            };
+                            
+                            var success = await _sqlService.ExecuteTaskStatusProcedureAsync(updateModel);
+                            if (success)
+                            {
+                                _logger.LogInformation("Estado da tarefa {TaskId} atualizado para Enviada (10) no SQL automaticamente.", task.Id);
+                            }
+                        }
                     }
                 }
                 if (updatedTasksCount > 0)
                 {
                     _logger.LogInformation("Sincronizadas {Count} tarefas modificadas às {Time}", updatedTasksCount, DateTimeOffset.UtcNow);
+                }
+
+                // Sincronização de Mensagens enviadas pela Sede no Backoffice (SQL -> Firebase)
+                var pendingSqlNotifications = await _sqlService.GetPendingNotificationsAsync();
+                int sentCount = 0;
+                foreach (var notif in pendingSqlNotifications)
+                {
+                    if (string.IsNullOrEmpty(notif.FirebaseUid)) continue;
+
+                    var fbMsg = new MessageFirebaseModel
+                    {
+                        Id = notif.Id.ToString(), // usar o ID do SQL como ID do documento no Firebase para evitar duplicados e permitir ack
+                        Text = notif.Body ?? "",
+                        Sender = "hq",
+                        DriverId = notif.FirebaseUid,
+                        Status = "sent",
+                        Type = "text",
+                        Timestamp = notif.Date ?? DateTime.UtcNow,
+                        SqlNotificationId = notif.Id.ToString(),
+                        NeedsSqlSync = false // já veio do SQL, não precisa voltar
+                    };
+
+                    await _firebaseService.UpsertMessageAsync(fbMsg);
+                    await _sqlService.MarkNotificationAsSentAsync(notif.Id);
+                    sentCount++;
+                }
+                
+                if (sentCount > 0)
+                {
+                    _logger.LogInformation("Enviadas {Count} notificações do SQL para o Firebase.", sentCount);
+                }
+
+                // Sincronização de Mensagens enviadas pela Sede (Firebase -> SQL dbo.notification)
+                var pendingMessages = await _firebaseService.GetMessagesPendingSqlSyncAsync();
+                if (pendingMessages.Any())
+                {
+                    _logger.LogInformation("Mensagens pendentes de inserção no SQL: {Count}", pendingMessages.Count);
+                    foreach (var msg in pendingMessages)
+                    {
+                        var driverId = await _sqlService.GetDriverIdByFirebaseUidAsync(msg.DriverId);
+                        if (driverId.HasValue && driverId.Value > 0)
+                        {
+                            string sqlId = await _sqlService.InsertNotificationAsync(driverId.Value, msg);
+                            await _firebaseService.MarkMessageAsSyncedAsync(msg.Id, sqlId);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Não foi possível encontrar o motorista no SQL para o Firebase Uid {Uid}", msg.DriverId);
+                        }
+                    }
+                }
+
+                // Sincronização de estado de leitura das mensagens (App Motorista -> SQL ack=1)
+                var readMessages = await _firebaseService.GetMessagesPendingAckSyncAsync();
+                if (readMessages.Any())
+                {
+                    foreach (var msg in readMessages)
+                    {
+                        if (!string.IsNullOrEmpty(msg.SqlNotificationId))
+                        {
+                            await _sqlService.UpdateNotificationAckAsync(msg.SqlNotificationId, DateTime.UtcNow);
+                            await _firebaseService.MarkMessageAsAckedAsync(msg.Id);
+                        }
+                    }
+                }
+
+                // Limpeza de tarefas apagadas ou concluídas no SQL que ainda estão ativas no Firebase
+                if (DateTime.UtcNow - _lastTaskCleanupTime >= _taskCleanupInterval)
+                {
+                    _logger.LogInformation("A verificar tarefas apagadas/concluídas para limpar do Firebase...");
+                    var activeFirebaseTasks = await _firebaseService.GetActiveFirebaseTasksAsync();
+                    
+                    var activeSqlTaskIds = activeTasks.Select(t => t.Id.ToString()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    int removedCount = 0;
+
+                    foreach(var fbTask in activeFirebaseTasks)
+                    {
+                        _logger.LogInformation("Avaliar FirebaseTask {Id}: SqlId='{SqlId}', NeedsSqlSync={NeedsSync}, Contains={Contains}", fbTask.Id, fbTask.SqlId, fbTask.NeedsSqlSync, activeSqlTaskIds.Contains(fbTask.SqlId));
+                        
+                        // Se a tarefa no Firebase diz que está pendente de sync, não a apagamos
+                        if (fbTask.NeedsSqlSync) continue; 
+                        
+                        // Se a tarefa já está terminada ou anulada no Firebase, não a apagamos!
+                        if (fbTask.Status == "terminada" || fbTask.Status == "completed" || fbTask.Status == "anulada") continue;
+
+                        // Se a tarefa não tem SqlId (criada no Firebase/Backoffice diretamente), não a apagamos
+                        if (string.IsNullOrEmpty(fbTask.SqlId)) continue;
+
+                        // Se a tarefa existe no Firebase (e não está terminada nem anulada), mas já não vem nas activeTasks do SQL,
+                        // significa que foi apagada (deleted=1) ou o seu estado avançou no SQL (>=80) via Backoffice.
+                        if (!activeSqlTaskIds.Contains(fbTask.SqlId))
+                        {
+                            var sqlTask = await _sqlService.GetTaskByIdAsync(fbTask.SqlId);
+                            if (sqlTask == null || sqlTask.Deleted)
+                            {
+                                await _firebaseService.DeleteTaskAsync(fbTask.Id);
+                                removedCount++;
+                                _logger.LogInformation("Tarefa {TaskId} (SqlId: {SqlId}) removida do Firebase porque foi eliminada/não existe no SQL.", fbTask.Id, fbTask.SqlId);
+                            }
+                            else if (sqlTask.Status == "80" || sqlTask.Status == "90")
+                            {
+                                // O estado avançou no SQL (concluída/anulada). Em vez de apagar do Firebase,
+                                // atualizamos o estado no Firebase para manter o histórico (trips/past tasks).
+                                await _firebaseService.UpsertTaskAsync(sqlTask);
+                                _logger.LogInformation("Tarefa {TaskId} (SqlId: {SqlId}) atualizada para estado final no Firebase ({Status}) em vez de ser removida.", fbTask.Id, fbTask.SqlId, sqlTask.Status);
+                            }
+                            else
+                            {
+                                await _firebaseService.DeleteTaskAsync(fbTask.Id);
+                                removedCount++;
+                                _logger.LogInformation("Tarefa {TaskId} (SqlId: {SqlId}) removida do Firebase por inconsistência de estado no SQL.", fbTask.Id, fbTask.SqlId);
+                            }
+                        }
+                    }
+                    if (removedCount > 0)
+                    {
+                        _logger.LogInformation("Limpeza concluída. {Count} tarefas obsoletas removidas do Firebase.", removedCount);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Limpeza concluída. Nenhuma tarefa obsoleta encontrada.");
+                    }
+                    _lastTaskCleanupTime = DateTime.UtcNow;
                 }
             }
             catch (Exception ex)

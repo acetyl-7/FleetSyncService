@@ -13,13 +13,19 @@ public interface ISqlService
     Task ExecuteSqlAsync(string sql);
     Task<IEnumerable<DriverSqlModel>> GetActiveDriversAsync();
     Task<IEnumerable<TaskSqlModel>> GetActiveTasksAsync();
+    Task<TaskSqlModel?> GetTaskByIdAsync(string sqlId);
     Task<int> UpsertMotoristaFromFirebaseAsync(DriverFirebaseModel firebaseDriver);
     Task<bool> CheckIfEmailExistsAsync(string email);
     Task LinkFirebaseUserToSqlAsync(string email, string firebaseUid);
     Task CreateNewMotoristaFromFirebaseAsync(string email, string nickname, string firebaseUid);
     Task<MotoristaValidationResult?> ValidateCompanyPhoneAsync(string phoneNumber);
     Task RegisterDriverAsync(string firebaseUid, string email, string phoneNumber, string nickName, int fleetcomDriverId);
+    Task<int?> GetDriverIdByFirebaseUidAsync(string firebaseUid);
     Task<bool> ExecuteTaskStatusProcedureAsync(TaskModel firebaseTask);
+    Task<string> InsertNotificationAsync(int fleetcomDriverId, MessageFirebaseModel message);
+    Task UpdateNotificationAckAsync(string notificationId, DateTime ackDate);
+    Task<IEnumerable<NotificationSqlModel>> GetPendingNotificationsAsync();
+    Task MarkNotificationAsSentAsync(Guid id);
 }
 
 public class SqlService : ISqlService
@@ -67,6 +73,27 @@ public class SqlService : ISqlService
             LEFT JOIN dbo.task_type tt ON t.fleetcomTaskTypeId = tt.fleetcomId
             WHERE t.deleted IS NULL AND t.status < 80";
         return await connection.QueryAsync<TaskSqlModel>(query);
+    }
+
+    public async Task<TaskSqlModel?> GetTaskByIdAsync(string sqlId)
+    {
+        if (string.IsNullOrEmpty(sqlId) || !Guid.TryParse(sqlId, out var guid)) return null;
+        using var connection = new SqlConnection(_connectionString);
+        var query = @"
+            SELECT 
+                t.id, t.fleetcomTaskOrder, t.fleetcomTaskId, t.fleetcomDriverId, 
+                t.fleetcomTractorId, t.fleetcomTrailerId, t.fleetcomTaskTypeId,
+                t.tractorPlate, t.trailerPlate, t.city, t.address, t.country, t.lat, t.lon, 
+                t.[ref], t.obs,
+                CAST(t.date AS DATETIME2) AS date, 
+                CAST(t.status AS VARCHAR(10)) AS status, 
+                CAST(t.lastUpdated AS DATETIME2) AS lastUpdated, 
+                CAST(CASE WHEN t.deleted IS NULL THEN 0 ELSE 1 END AS BIT) AS deleted,
+                ISNULL(tt.fleetcomName, '') AS taskTypeName
+            FROM dbo.task t
+            LEFT JOIN dbo.task_type tt ON t.fleetcomTaskTypeId = tt.fleetcomId
+            WHERE t.id = @Id";
+        return await connection.QueryFirstOrDefaultAsync<TaskSqlModel>(query, new { Id = guid });
     }
 
     public async Task<int> UpsertMotoristaFromFirebaseAsync(DriverFirebaseModel firebaseDriver)
@@ -204,7 +231,8 @@ public class SqlService : ISqlService
 
     private int TraduzirEstadoParaSql(string firebaseStatus)
     {
-        return firebaseStatus?.ToLower() switch
+        var statusLower = firebaseStatus?.Trim().ToLower();
+        var result = statusLower switch
         {
             "pending" or "por_enviar" => 1,
             "enviada" => 10,
@@ -213,8 +241,15 @@ public class SqlService : ISqlService
             "in_progress" or "iniciada" => 40,
             "terminada" or "completed" => 80,
             "anulada" => 90,
-            _ => 1 // Default para Por Enviar
+            _ => -1 // Mudado para -1 para detetar fallbacks
         };
+
+        if (result == -1)
+        {
+            Console.WriteLine($"[WARNING] Estado do Firebase desconhecido: '{firebaseStatus}'. A assumir estado 1.");
+            return 1;
+        }
+        return result;
     }
 
 
@@ -295,11 +330,11 @@ public class SqlService : ISqlService
                     DATA_SISTEMA = agora,
                     LAT = firebaseTask.Lat ?? 0.0,
                     LON = firebaseTask.Lon ?? 0.0,
-                    CITY = (string)null,
+                    CITY = (string?)null,
                     FREE_SPACE = 0,
-                    TEMPERATURA = (string)null,
+                    TEMPERATURA = (string?)null,
                     DURATION = 0,
-                    LOCATION = (string)null
+                    LOCATION = (string?)null
                 },
                 commandType: CommandType.StoredProcedure
             );
@@ -313,5 +348,104 @@ public class SqlService : ISqlService
             _logger.LogError(ex, "Erro ao executar procedure dbo.PROCESSA_TASK_STATUS para a tarefa {SqlId}.", firebaseTask.SqlId);
             return false;
         }
+    }
+
+    public async Task<int?> GetDriverIdByFirebaseUidAsync(string firebaseUid)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        var id = await connection.QueryFirstOrDefaultAsync<int?>(
+            "SELECT fleetcomDriverId FROM dbo.driver WHERE firebaseUid = @Uid", 
+            new { Uid = firebaseUid });
+        
+        // Se não encontrar na tabela driver, tenta na v_motorista_todos (caso raro)
+        if (id == null || id == 0)
+        {
+            id = await connection.QueryFirstOrDefaultAsync<int?>(
+                "SELECT ID FROM dbo.v_motorista_todos WHERE FIREBASE_UID = @Uid", 
+                new { Uid = firebaseUid });
+        }
+        
+        return id;
+    }
+
+    public async Task<string> InsertNotificationAsync(int fleetcomDriverId, MessageFirebaseModel message)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        
+        var query = @"
+            INSERT INTO dbo.notification (
+                fleetcomId, fleetcomDriverId, fleetcomUserId, date, title, body, 
+                callback, ack, ackDate, sent, system, sentDate, attachmentId, 
+                lastUpdated, clientLastUpdated, deleted, replicationStatus, 
+                fleecomRecordStatus, expirationDateTime, type
+            )
+            OUTPUT INSERTED.id
+            VALUES (
+                NULL, @FleetcomDriverId, 1, @Date, 'Mensagem', @Body,
+                NULL, 0, NULL, 0, 0, NULL, NULL,
+                @Date, NULL, NULL, 1,
+                0, NULL, NULL
+            );";
+
+        var idGuid = await connection.ExecuteScalarAsync<Guid>(query, new {
+            FleetcomDriverId = fleetcomDriverId,
+            Date = message.Timestamp ?? DateTime.UtcNow,
+            Body = message.Text
+        });
+        
+        var id = idGuid.ToString();
+
+        _logger.LogInformation("Notificação inserida no SQL (ID: {Id}) para motorista {DriverId}", id, fleetcomDriverId);
+        return id;
+    }
+
+    public async Task UpdateNotificationAckAsync(string notificationId, DateTime ackDate)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        
+        if (!Guid.TryParse(notificationId, out var idGuid))
+        {
+            _logger.LogWarning("ID de notificação inválido: {Id}", notificationId);
+            return;
+        }
+
+        var query = @"
+            UPDATE dbo.notification
+            SET ack = 1,
+                ackDate = @AckDate,
+                lastUpdated = @AckDate
+            WHERE id = @Id";
+
+        await connection.ExecuteAsync(query, new { Id = idGuid, AckDate = ackDate });
+        _logger.LogInformation("Notificação SQL (ID: {Id}) marcada como lida (ack=1)", notificationId);
+    }
+
+    public async Task<IEnumerable<NotificationSqlModel>> GetPendingNotificationsAsync()
+    {
+        using var connection = new SqlConnection(_connectionString);
+        var query = @"
+            SELECT 
+                n.id as Id,
+                n.fleetcomDriverId as FleetcomDriverId,
+                d.firebaseUid as FirebaseUid,
+                CAST(n.date AS DATETIME2) as Date,
+                n.body as Body
+            FROM dbo.notification n
+            INNER JOIN dbo.driver d ON n.fleetcomDriverId = d.fleetcomDriverId
+            WHERE (n.sent = 0 OR n.sent IS NULL) 
+              AND n.deleted IS NULL
+              AND d.firebaseUid IS NOT NULL
+              AND n.fleetcomUserId IS NOT NULL
+              AND (n.ack = 0 OR n.ack IS NULL)";
+              
+        return await connection.QueryAsync<NotificationSqlModel>(query);
+    }
+    
+    public async Task MarkNotificationAsSentAsync(Guid id)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        await connection.ExecuteAsync(
+            "UPDATE dbo.notification SET sent = 1, sentDate = @Now WHERE id = @Id", 
+            new { Now = DateTime.UtcNow, Id = id });
     }
 }

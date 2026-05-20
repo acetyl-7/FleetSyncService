@@ -10,6 +10,7 @@ public interface IFirebaseService
     Task<FirestoreDb> GetDatabaseAsync();
     Task UpsertDriverAsync(DriverSqlModel sqlDriver);
     Task UpsertTaskAsync(TaskSqlModel sqlTask);
+    Task UpsertMessageAsync(MessageFirebaseModel msg);
     void StartTasksListener(Func<Guid, string, DateTime, Task> onTaskUpdatedCallback, ILogger logger);
     Task<IEnumerable<DriverFirebaseModel>> GetAuthorizedDriversAsync();
     Task<IEnumerable<DriverFirebaseModel>> GetAllFirebaseUsersAsync();
@@ -17,6 +18,12 @@ public interface IFirebaseService
     Task UpdateDriverIdAsync(string uid, string driverId);
     Task<List<TaskModel>> GetTasksPendingSqlSyncAsync();
     Task MarkTaskAsSyncedAsync(string firebaseTaskId);
+    Task<List<TaskModel>> GetActiveFirebaseTasksAsync();
+    Task DeleteTaskAsync(string taskId);
+    Task<List<MessageFirebaseModel>> GetMessagesPendingSqlSyncAsync();
+    Task MarkMessageAsSyncedAsync(string messageId, string sqlNotificationId);
+    Task<List<MessageFirebaseModel>> GetMessagesPendingAckSyncAsync();
+    Task MarkMessageAsAckedAsync(string messageId);
 }
 
 public class FirebaseService : IFirebaseService
@@ -86,6 +93,7 @@ public class FirebaseService : IFirebaseService
         string firebaseStatus = sqlTask.Status?.ToString() switch
         {
             "0" => "por_enviar",
+            "1" => "por_enviar",
             "10" => "enviada",
             "20" => "recebida",
             "30" => "vista",
@@ -113,7 +121,8 @@ public class FirebaseService : IFirebaseService
             { "fleetcomTractorId", sqlTask.FleetcomTractorId },
             { "fleetcomTrailerId", sqlTask.FleetcomTrailerId },
             { "fleetcomTaskTypeId", sqlTask.FleetcomTaskTypeId },
-            { "date", sqlTask.Date.HasValue ? Timestamp.FromDateTime(sqlTask.Date.Value.ToUniversalTime()) : null }
+            { "date", sqlTask.Date.HasValue ? Timestamp.FromDateTime(sqlTask.Date.Value.ToUniversalTime()) : null },
+            { "timestamp", sqlTask.Date.HasValue ? Timestamp.FromDateTime(sqlTask.Date.Value.ToUniversalTime()) : Timestamp.FromDateTime(DateTime.UtcNow) }
         };
 
         // Remove valores nulos para não sujar o Firebase
@@ -128,6 +137,25 @@ public class FirebaseService : IFirebaseService
             cleanData.Remove("status");
         }
 
+        await docRef.SetAsync(cleanData, SetOptions.MergeAll);
+    }
+
+    public async Task UpsertMessageAsync(MessageFirebaseModel msg)
+    {
+        var docRef = _db.Collection("messages").Document(msg.Id);
+        var data = new Dictionary<string, object?>
+        {
+            { "text", msg.Text },
+            { "sender", msg.Sender },
+            { "driverId", msg.DriverId },
+            { "status", msg.Status },
+            { "type", msg.Type },
+            { "timestamp", msg.Timestamp.HasValue ? Timestamp.FromDateTime(msg.Timestamp.Value.ToUniversalTime()) : null },
+            { "sqlNotificationId", msg.SqlNotificationId },
+            { "needsSqlSync", msg.NeedsSqlSync }
+        };
+
+        var cleanData = data.Where(kv => kv.Value != null).ToDictionary(kv => kv.Key, kv => kv.Value);
         await docRef.SetAsync(cleanData, SetOptions.MergeAll);
     }
 
@@ -306,5 +334,106 @@ public class FirebaseService : IFirebaseService
     {
         var docRef = _db.Collection("tasks").Document(firebaseTaskId);
         await docRef.SetAsync(new Dictionary<string, object> { { "needsSqlSync", false } }, SetOptions.MergeAll);
+    }
+
+    public async Task<List<TaskModel>> GetActiveFirebaseTasksAsync()
+    {
+        var snapshot = await _db.Collection("tasks")
+            .GetSnapshotAsync();
+            
+        var list = new List<TaskModel>();
+        foreach (var doc in snapshot.Documents)
+        {
+            if (!doc.Exists) continue;
+            list.Add(new TaskModel
+            {
+                Id = doc.Id,
+                SqlId = doc.ContainsField("sqlId") ? doc.GetValue<string>("sqlId") : string.Empty,
+                Status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty,
+                NeedsSqlSync = doc.ContainsField("needsSqlSync") && doc.GetValue<bool>("needsSqlSync")
+            });
+        }
+        return list;
+    }
+
+    public async Task DeleteTaskAsync(string taskId)
+    {
+        var docRef = _db.Collection("tasks").Document(taskId);
+        await docRef.DeleteAsync();
+    }
+
+    public async Task<List<MessageFirebaseModel>> GetMessagesPendingSqlSyncAsync()
+    {
+        var snapshot = await _db.Collection("messages")
+            .WhereEqualTo("sender", "hq")
+            .WhereEqualTo("needsSqlSync", true)
+            .GetSnapshotAsync();
+
+        var list = new List<MessageFirebaseModel>();
+        foreach (var doc in snapshot.Documents)
+        {
+            if (!doc.Exists) continue;
+            
+            DateTime? timestamp = null;
+            if (doc.ContainsField("timestamp"))
+            {
+                var ts = doc.GetValue<Timestamp>("timestamp");
+                timestamp = ts.ToDateTime();
+            }
+
+            list.Add(new MessageFirebaseModel
+            {
+                Id = doc.Id,
+                Text = doc.ContainsField("text") ? doc.GetValue<string>("text") : string.Empty,
+                Sender = doc.ContainsField("sender") ? doc.GetValue<string>("sender") : string.Empty,
+                DriverId = doc.ContainsField("driverId") ? doc.GetValue<string>("driverId") : string.Empty,
+                Status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty,
+                Type = doc.ContainsField("type") ? doc.GetValue<string>("type") : string.Empty,
+                Timestamp = timestamp,
+                NeedsSqlSync = true
+            });
+        }
+        return list;
+    }
+
+    public async Task MarkMessageAsSyncedAsync(string messageId, string sqlNotificationId)
+    {
+        var docRef = _db.Collection("messages").Document(messageId);
+        await docRef.SetAsync(new Dictionary<string, object> 
+        { 
+            { "needsSqlSync", false },
+            { "sqlNotificationId", sqlNotificationId },
+            { "sqlAck", false }
+        }, SetOptions.MergeAll);
+    }
+
+    public async Task<List<MessageFirebaseModel>> GetMessagesPendingAckSyncAsync()
+    {
+        var snapshot = await _db.Collection("messages")
+            .WhereEqualTo("sender", "hq")
+            .WhereEqualTo("status", "read")
+            .WhereEqualTo("sqlAck", false)
+            .GetSnapshotAsync();
+
+        var list = new List<MessageFirebaseModel>();
+        foreach (var doc in snapshot.Documents)
+        {
+            if (!doc.Exists) continue;
+
+            var data = doc.ToDictionary();
+            list.Add(new MessageFirebaseModel
+            {
+                Id = doc.Id,
+                SqlNotificationId = data.ContainsKey("sqlNotificationId") ? data["sqlNotificationId"]?.ToString() : null,
+                Status = "read"
+            });
+        }
+        return list;
+    }
+
+    public async Task MarkMessageAsAckedAsync(string messageId)
+    {
+        var docRef = _db.Collection("messages").Document(messageId);
+        await docRef.SetAsync(new Dictionary<string, object> { { "sqlAck", true } }, SetOptions.MergeAll);
     }
 }
