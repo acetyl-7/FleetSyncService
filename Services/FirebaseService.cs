@@ -1,12 +1,16 @@
+#pragma warning disable CS8602
+
 using FleetSyncService.Config;
 using FleetSyncService.Models;
 using Google.Cloud.Firestore;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
 
 namespace FleetSyncService.Services;
 
 public interface IFirebaseService
 {
+    bool IsEnabled { get; }
     Task<FirestoreDb> GetDatabaseAsync();
     Task UpsertDriverAsync(DriverSqlModel sqlDriver);
     Task UpsertTaskAsync(TaskSqlModel sqlTask);
@@ -29,15 +33,20 @@ public interface IFirebaseService
 public class FirebaseService : IFirebaseService
 {
     private readonly FirebaseConfig _config;
-    private readonly FirestoreDb _db;
+    private readonly FirestoreDb? _db;
+    private readonly bool _isEnabled;
 
-    public FirebaseService(IOptions<FirebaseConfig> config)
+    public bool IsEnabled => _isEnabled;
+
+    public FirebaseService(IOptions<FirebaseConfig> config, ILogger<FirebaseService> logger)
     {
         _config = config.Value;
 
         if (string.IsNullOrEmpty(_config.ProjectId))
         {
-            throw new InvalidOperationException("Firebase ProjectId is not configured in appsettings.json.");
+            logger.LogError("Firebase ProjectId is not configured in appsettings.json.");
+            _isEnabled = false;
+            return;
         }
 
         // Initialize Firestore with credentials
@@ -50,10 +59,27 @@ public class FirebaseService : IFirebaseService
             Environment.SetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json");
         }
 
-        _db = FirestoreDb.Create(_config.ProjectId);
+        try
+        {
+            _db = FirestoreDb.Create(_config.ProjectId);
+            _isEnabled = true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("Could not initialize Firestore: {Message}. Firebase synchronization features will be disabled. To enable them, please place a valid 'service-account.json' in the project root or configure 'CredentialsFilePath' in appsettings.json.", ex.Message);
+            _db = null;
+            _isEnabled = false;
+        }
     }
 
-    public Task<FirestoreDb> GetDatabaseAsync() => Task.FromResult(_db);
+    public Task<FirestoreDb> GetDatabaseAsync()
+    {
+        if (_db == null)
+        {
+            throw new InvalidOperationException("Firebase database is not initialized due to missing credentials.");
+        }
+        return Task.FromResult(_db);
+    }
 
     public async Task UpsertDriverAsync(DriverSqlModel sqlDriver)
     {

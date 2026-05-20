@@ -34,6 +34,13 @@ public class Worker : BackgroundService
         {
             try
             {
+                if (!_firebaseService.IsEnabled)
+                {
+                    _logger.LogWarning("Firebase synchronization is disabled due to missing credentials. The sync cycle will be skipped. To fix this, place 'service-account.json' in the project root or configure 'CredentialsFilePath' in appsettings.json.");
+                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                    continue;
+                }
+
                 _logger.LogInformation("Sync Service a correr");
 
                 // 0. Sincronização: Firebase (Firestore) -> SQL (dbo.driver)
