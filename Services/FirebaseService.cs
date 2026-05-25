@@ -28,6 +28,7 @@ public interface IFirebaseService
     Task MarkMessageAsSyncedAsync(string messageId, string sqlNotificationId);
     Task<List<MessageFirebaseModel>> GetMessagesPendingAckSyncAsync();
     Task MarkMessageAsAckedAsync(string messageId);
+    Task IncrementYearlyStatsAsync(string driverId, DateTime date, string type);
 }
 
 public class FirebaseService : IFirebaseService
@@ -350,7 +351,9 @@ public class FirebaseService : IFirebaseService
                 Lat = lat,
                 Lon = lon,
                 NeedsSqlSync = true,
-                FleetcomTaskTypeId = doc.ContainsField("fleetcomTaskTypeId") ? (int?)doc.GetValue<long>("fleetcomTaskTypeId") : null
+                FleetcomTaskTypeId = doc.ContainsField("fleetcomTaskTypeId") ? (int?)doc.GetValue<long>("fleetcomTaskTypeId") : null,
+                DriverId = doc.ContainsField("driverId") ? doc.GetValue<string>("driverId") : string.Empty,
+                CompletedAt = statusDate
             });
         }
         return list;
@@ -461,5 +464,25 @@ public class FirebaseService : IFirebaseService
     {
         var docRef = _db.Collection("messages").Document(messageId);
         await docRef.SetAsync(new Dictionary<string, object> { { "sqlAck", true } }, SetOptions.MergeAll);
+    }
+
+    public async Task IncrementYearlyStatsAsync(string driverId, DateTime date, string type)
+    {
+        if (string.IsNullOrEmpty(driverId)) return;
+        
+        var yearStr = date.Year.ToString();
+        var monthStr = date.Month.ToString(); // ex: "1", "2" ... "12"
+        
+        var docRef = _db.Collection("users")
+                        .Document(driverId)
+                        .Collection("yearly_stats")
+                        .Document(yearStr);
+                        
+        var updates = new Dictionary<string, object>
+        {
+            { $"{type}.{monthStr}", FieldValue.Increment(1) }
+        };
+        
+        await docRef.SetAsync(updates, SetOptions.MergeAll);
     }
 }

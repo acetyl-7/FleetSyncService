@@ -26,6 +26,9 @@ public interface ISqlService
     Task UpdateNotificationAckAsync(string notificationId, DateTime ackDate);
     Task<IEnumerable<NotificationSqlModel>> GetPendingNotificationsAsync();
     Task MarkNotificationAsSentAsync(Guid id);
+    Task<bool> ExecuteProcessaIncidenteProcedureAsync(IncidentModel incident);
+    Task<bool> ExecuteProcessaAbastecimentoProcedureAsync(AbastecimentoModel fueling);
+    Task<bool> ExecuteProcessaRelViagemProcedureAsync(RelViagemModel trip);
 }
 
 public class SqlService : ISqlService
@@ -444,8 +447,120 @@ public class SqlService : ISqlService
     public async Task MarkNotificationAsSentAsync(Guid id)
     {
         using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
         await connection.ExecuteAsync(
             "UPDATE dbo.notification SET sent = 1, sentDate = @Now WHERE id = @Id", 
             new { Now = DateTime.UtcNow, Id = id });
+    }
+
+    public async Task<bool> ExecuteProcessaIncidenteProcedureAsync(IncidentModel incident)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        try
+        {
+            await connection.ExecuteAsync(
+                "dbo.PROCESSA_INCIDENTE",
+                new {
+                    DT_INCIDENTE = incident.DtIncidente,
+                    DT_USER = incident.DtUser,
+                    MOBILE_DRIVER_ID = incident.MobileDriverId,
+                    LAT = incident.Lat,
+                    LON = incident.Lon,
+                    KMS = incident.Kms,
+                    MAT_TRACTOR = incident.MatTractor,
+                    MAT_REBOQUE = incident.MatReboque,
+                    IMAGE_IDS = incident.ImageIds,
+                    DESCRICAO = incident.Descricao,
+                    TIPO = incident.Tipo,
+                    RAZAO_CUSTOM = incident.RazaoCustom
+                },
+                commandType: CommandType.StoredProcedure
+            );
+
+            _logger.LogInformation("Procedure dbo.PROCESSA_INCIDENTE executada com sucesso para motorista {DriverId}", incident.MobileDriverId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao executar procedure dbo.PROCESSA_INCIDENTE para motorista {DriverId}.", incident.MobileDriverId);
+            return false;
+        }
+    }
+
+    public async Task<bool> ExecuteProcessaAbastecimentoProcedureAsync(AbastecimentoModel fueling)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        try
+        {
+            await connection.ExecuteAsync(
+                "dbo.PROCESSA_ABASTECIMENTO",
+                new {
+                    DT_REAL = fueling.DtReal,
+                    DT_USER = fueling.DtUser,
+                    MOBILE_DRIVER_ID = fueling.MobileDriverId,
+                    LAT = fueling.Lat,
+                    LON = fueling.Lon,
+                    KMS = fueling.Kms,
+                    LITROS = fueling.Litros,
+                    MAT_TRACTOR = fueling.MatTractor,
+                    MAT_REBOQUE = fueling.MatReboque,
+                    TIPO_CARTAO = fueling.TipoCartao,
+                    NOTA = fueling.Nota,
+                    IMAGEM = fueling.Imagem,
+                    TIPO_PROD = fueling.TipoProd,
+                    ATESTO = fueling.Atesto
+                },
+                commandType: CommandType.StoredProcedure
+            );
+
+            _logger.LogInformation("Procedure dbo.PROCESSA_ABASTECIMENTO executada com sucesso para motorista {DriverId}", fueling.MobileDriverId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao executar procedure dbo.PROCESSA_ABASTECIMENTO para motorista {DriverId}.", fueling.MobileDriverId);
+            return false;
+        }
+    }
+
+    public async Task<bool> ExecuteProcessaRelViagemProcedureAsync(RelViagemModel trip)
+    {
+        using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        try
+        {
+            await connection.ExecuteAsync(
+                "dbo.PROCESSA_REL_VIAGEM",
+                new {
+                    DT_REAL_INICIO = trip.DtRealInicio,
+                    DT_USER_INICIO = trip.DtUserInicio,
+                    DT_REAL_FIM = trip.DtRealFim,
+                    DT_USER_FIM = trip.DtUserFim,
+                    MOBILE_DRIVER_ID = trip.MobileDriverId,
+                    LAT_INICO = trip.LatInicio,   // Mapeado de acordo com o nome exato na assinatura fornecida (@LAT_INICO)
+                    LAT_FIM = trip.LatFim,
+                    LON_INICO = trip.LonInicio,   // Mapeado de acordo com o nome exato na assinatura fornecida (@LON_INICO)
+                    LON_FIM = trip.LonFim,
+                    KMS_INICIO = trip.KmsInicio,
+                    KMS_FIM = trip.KmsFim,
+                    MAT_TRACTOR = trip.MatTractor,
+                    MAT_REBOQUE = trip.MatReboque
+                },
+                commandType: CommandType.StoredProcedure
+            );
+
+            _logger.LogInformation("Procedure dbo.PROCESSA_REL_VIAGEM executada com sucesso para motorista {DriverId}", trip.MobileDriverId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao executar procedure dbo.PROCESSA_REL_VIAGEM para motorista {DriverId}.", trip.MobileDriverId);
+            return false;
+        }
     }
 }

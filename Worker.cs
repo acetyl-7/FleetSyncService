@@ -85,8 +85,18 @@ public class Worker : BackgroundService
                     var success = await _sqlService.ExecuteTaskStatusProcedureAsync(task);
                     if (success)
                     {
-                        await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
-                        _logger.LogInformation("Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
+                        // Se a tarefa está num estado final (concluída/anulada), incrementamos estatísticas e eliminamos
+                        if (task.Status == "terminada" || task.Status == "completed" || task.Status == "anulada")
+                        {
+                            await _firebaseService.IncrementYearlyStatsAsync(task.DriverId, task.CompletedAt ?? DateTime.UtcNow, "tasks");
+                            await _firebaseService.DeleteTaskAsync(task.Id);
+                            _logger.LogInformation("Tarefa {TaskId} concluída e removida do Firebase após sync.", task.Id);
+                        }
+                        else
+                        {
+                            await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
+                            _logger.LogInformation("Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
+                        }
                     }
                     else
                     {
