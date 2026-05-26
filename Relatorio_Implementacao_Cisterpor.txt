@@ -1,0 +1,129 @@
+================================================================================
+                    RELATÓRIO DE DIAGNÓSTICO E IMPLEMENTAÇÃO
+        PLANO INICIAL DE IMPLEMENTAÇÃO DE SOFTWARE - APPS LOGÍSTICA CISTERPOR
+================================================================================
+Data: 26 de Maio de 2026
+Estagiário: [Nome do Estagiário]
+Empresa: Cisterpor
+Projeto: Sistema de Sincronização e Comunicação com Motoristas (FleetSync)
+Tecnologias: Flutter (Dart), .NET 8 (C# Core), SQL Server, Firebase (Firestore/Auth)
+================================================================================
+
+1. INTRODUÇÃO E ENQUADRAMENTO DO PROJETO
+--------------------------------------------------------------------------------
+No âmbito do estágio curricular, o dia de hoje foi focado na análise profunda do 
+fluxo de autenticação, registo de utilizadores e sincronização de dados entre a 
+infraestrutura local da Cisterpor (SQL Server), o serviço de sincronização intermédio 
+(FleetSyncService em .NET 8) e a plataforma Cloud da Google (Firebase Firestore).
+
+O ecossistema em análise é composto por três componentes core:
+  - backoffice_logistica: Web/Desktop App em Flutter para a gestão na sede.
+  - chat_logistica: App Móvel em Flutter dedicada aos motoristas de frota.
+  - fleetsyncservice: Serviço Windows em C# Core que garante o "Delta Sync" bidirecional.
+
+Durante este dia, foram alcançados marcos fundamentais no diagnóstico de erros 
+críticos de registo de utilizadores e na estruturação do plano de transição para 
+o novo ambiente de produção do Firebase.
+
+
+2. TAREFA 1: DIAGNÓSTICO DO ERRO DE REGISTO DE TELEMÓVEL DE EMPRESA
+--------------------------------------------------------------------------------
+* Contexto do Problema:
+  Vários utilizadores (motoristas) depararam-se com o erro bloqueante 
+  "Telemóvel de empresa não encontrado. Contacta o teu gestor de frota" ao tentar 
+  efetuar o registo inicial (sign-up/login) na aplicação móvel.
+
+* Procedimento de Diagnóstico Executado:
+  1. Engenharia Inversa no Flutter: Analisámos o fluxo em 'sign_up_screen.dart'. 
+     Detetámos que a app móvel faz um pedido GET HTTP à API local em:
+     '$_apiBaseUrl/api/validate-phone?phone=$normalized'
+     Qualquer falha física de rede, timeout (10s) ou resposta não-200 devolve 
+     nulo, disparando o aviso genérico de "Telemóvel não encontrado".
+
+  2. Rastreio da API (.NET 8): Identificámos no serviço C# ('Program.cs') o 
+     mapeamento do endpoint '/api/validate-phone', que invoca o método 
+     'ValidateCompanyPhoneAsync' do serviço 'SqlService.cs'.
+
+  3. Inspeção e Auditoria da Base de Dados (SQL Server):
+     Desenvolvemos um script de diagnóstico em PowerShell/SQL para auditar a vista 
+     'dbo.v_MOTORISTA_TODOS' na base de dados de produção 'MOBILE_APP'. 
+     Os resultados estatísticos foram reveladores:
+       - Total de motoristas ativos no sistema: 23
+       - Motoristas com 'TELEMOVEL_EMPRESA' preenchido: 22
+       - Motoristas com 'TELEMOVEL' (pessoal) preenchido: 17
+       - Motoristas apenas com telemóvel pessoal e sem número de empresa: 1 (ex: Vítor Agostinho)
+
+* Conclusões Técnicas / Causas Identificadas:
+  - Causa A (Inconsistência de Dados): O método de validação do backend pesquisa 
+    restritamente pela coluna 'TELEMOVEL_EMPRESA'. Se um motorista tiver o seu número 
+    registado apenas na coluna 'TELEMOVEL' (pessoal) ou se a empresa não tiver preenchido 
+    o número de empresa na ficha, a validação falha imediatamente na BD.
+  - Causa B (Limitação de Normalização): O backend remove caracteres não numéricos 
+    e descarta o indicativo '351' se estiver no início. No entanto, se o motorista 
+    introduzir '0035196XXXXXXX', o algoritmo falha ao remover o '00', originando 
+    uma pesquisa sem correspondência na base de dados.
+  - Causa C (Conectividade): Qualquer quebra de comunicação entre o telemóvel/emulador 
+    e o porto da API (192.168.1.5:5000) gera um timeout silencioso que se manifesta 
+    com esta mesma mensagem de erro.
+
+
+3. TAREFA 2: MAPEAMENTO E LIGAÇÃO AO PROJETO FIREBASE
+--------------------------------------------------------------------------------
+Para assegurar a integridade do ambiente e garantir que o Backoffice aponta para o 
+ambiente de dados correto, realizámos o mapeamento de dependências nos ficheiros 
+'firebase.json' e 'lib/firebase_options.dart'.
+
+* Descoberta da Arquitetura:
+  - O projeto oficial/produção da Cisterpor está associado ao ID do Firebase:
+    ==> cisterpor-fleetsync (utilizado nos builds para Android e Windows)
+  - Identificou-se uma ligação residual/histórica nos builds de iOS e Web para o ID:
+    ==> logichatinfofirst (usado anteriormente em fase de testes/desenvolvimento)
+
+Esta análise é de extrema importância para o relatório de estágio, pois demonstra 
+o rigor de controlo de ambientes (Desenvolvimento vs. Produção) essencial para a 
+manutenção de software profissional.
+
+
+4. TAREFA 3: ESTRATÉGIA DE MIGRAÇÃO DE ÍNDICES DO FIRESTORE
+--------------------------------------------------------------------------------
+Para acelerar o processo de query no novo ambiente 'cisterpor-fleetsync', 
+estruturámos um plano técnico para migrar os índices compostos sem afetar o 
+desenvolvimento contínuo.
+
+* Plano de Ação Estruturado:
+  1. Via Linha de Comando (Firebase CLI):
+     Instalar a CLI e descarregar a configuração existente do projeto inicial:
+     $ firebase use logichatinfofirst
+     $ firebase firestore:indexes > firestore.indexes.json
+     
+     Aplicar a mesma estrutura ao novo projeto de produção:
+     $ firebase use cisterpor-fleetsync
+     $ firebase deploy --only firestore:indexes
+
+  2. Via Consola Firebase:
+     Fazer a replicação manual dos índices compostos através da interface 
+     gráfica do Firestore.
+
+* Vantagem Arquitetural Identificada:
+  Os índices do Firestore correm inteiramente no lado do servidor (Cloud Google). 
+  Isso significa que a sua criação e migração não exigem qualquer tipo de 
+  recompilação de código ou reinstalação de aplicações (seja na app Flutter 
+  ou no serviço em C#). O serviço Windows C# apenas precisa de ser reiniciado 
+  caso se altere o ficheiro 'service-account.json' ou 'appsettings.json' com 
+  as novas credenciais.
+
+
+5. CONCLUSÃO E PRÓXIMOS PASSOS (ROADMAPPING)
+--------------------------------------------------------------------------------
+Com a execução bem-sucedida destas tarefas, estabelecemos as bases sólidas da 
+infraestrutura da Cisterpor. Como próximos passos para garantir a robustez total do 
+sistema, recomenda-se:
+  1. Alterar 'SqlService.cs' no backend para fazer a validação do número pesquisando 
+     tanto na coluna 'TELEMOVEL_EMPRESA' como em 'TELEMOVEL' (fall-back).
+  2. Implementar suporte na normalização para detetar e remover o prefixo '00351'.
+  3. Atualizar as configurações de iOS/Web no 'firebase_options.dart' do backoffice 
+     para que fiquem 100% alinhadas com o projeto de produção 'cisterpor-fleetsync'.
+
+================================================================================
+             Fim do Relatório - Cisterpor Implementação de Software
+================================================================================

@@ -50,14 +50,19 @@ public class FirebaseService : IFirebaseService
             return;
         }
 
-        // Initialize Firestore with credentials
-        if (!string.IsNullOrEmpty(_config.CredentialsFilePath) && System.IO.File.Exists(_config.CredentialsFilePath))
+        // Resolve absolute paths relative to application base directory to avoid issues when running as a Windows Service
+        string credentialsPath = string.IsNullOrEmpty(_config.CredentialsFilePath) 
+            ? "service-account.json" 
+            : _config.CredentialsFilePath;
+
+        if (!System.IO.Path.IsPathRooted(credentialsPath))
         {
-            Environment.SetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS", _config.CredentialsFilePath);
+            credentialsPath = System.IO.Path.Combine(AppContext.BaseDirectory, credentialsPath);
         }
-        else if (System.IO.File.Exists("service-account.json"))
+
+        if (System.IO.File.Exists(credentialsPath))
         {
-            Environment.SetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json");
+            Environment.SetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS", credentialsPath);
         }
 
         try
@@ -174,12 +179,14 @@ public class FirebaseService : IFirebaseService
         {
             { "text", msg.Text },
             { "sender", msg.Sender },
+            { "role", "hq" },
             { "driverId", msg.DriverId },
             { "status", msg.Status },
             { "type", msg.Type },
             { "timestamp", msg.Timestamp.HasValue ? Timestamp.FromDateTime(msg.Timestamp.Value.ToUniversalTime()) : null },
             { "sqlNotificationId", msg.SqlNotificationId },
-            { "needsSqlSync", msg.NeedsSqlSync }
+            { "needsSqlSync", msg.NeedsSqlSync },
+            { "sqlAck", false }
         };
 
         var cleanData = data.Where(kv => kv.Value != null).ToDictionary(kv => kv.Key, kv => kv.Value);
