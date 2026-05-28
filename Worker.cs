@@ -1,6 +1,7 @@
 using System.Linq;
 using FleetSyncService.Services;
 using FleetSyncService.Models;
+using Google.Cloud.Firestore;
 
 namespace FleetSyncService;
 
@@ -9,6 +10,11 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly IFirebaseService _firebaseService;
     private readonly ISqlService _sqlService;
+    
+    // Listeners em tempo real para o Firebase
+    private FirestoreChangeListener? _tasksListener;
+    private FirestoreChangeListener? _messagesListener;
+    private FirestoreChangeListener? _acksListener;
     
     // Controlo de tempo para não correr a sincronização de utilizadores a cada 10 segundos
     private DateTime _lastUserSyncTime = DateTime.MinValue;
@@ -26,10 +32,24 @@ public class Worker : BackgroundService
         _logger = logger;
         _firebaseService = firebaseService;
         _sqlService = sqlService;
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    }    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (_firebaseService.IsEnabled)
+        {
+            _logger.LogInformation("A inicializar os Real-Time Listeners do Firebase...");
+            try
+            {
+                _tasksListener = _firebaseService.ListenToPendingTasks(OnPendingTasksReceivedAsync);
+                _messagesListener = _firebaseService.ListenToPendingMessages(OnPendingMessagesReceivedAsync);
+                _acksListener = _firebaseService.ListenToPendingAcks(OnPendingAcksReceivedAsync);
+                _logger.LogInformation("Real-Time Listeners do Firebase ativados com sucesso.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erro ao inicializar os Real-Time Listeners do Firebase. O serviço continuará.");
+            }
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -74,34 +94,6 @@ public class Worker : BackgroundService
                     }
                     _logger.LogInformation("Sincronização concluída: {Count} motoristas processados para SQL.", syncedCount);
                     _lastUserSyncTime = DateTime.UtcNow;
-                }
-
-                // Sincronização Inversa (Firebase -> SQL) via Delta Sync
-                var pendingTasks = await _firebaseService.GetTasksPendingSqlSyncAsync();
-                _logger.LogInformation("Tarefas pendentes de sync Firebase->SQL: {Count}", pendingTasks.Count);
-                foreach (var task in pendingTasks)
-                {
-                    _logger.LogInformation("A processar tarefa pendente: Firebase={Id}, SqlId={SqlId}, Status={Status}", task.Id, task.SqlId, task.Status);
-                    var success = await _sqlService.ExecuteTaskStatusProcedureAsync(task);
-                    if (success)
-                    {
-                        // Se a tarefa está num estado final (concluída/anulada), incrementamos estatísticas e eliminamos
-                        if (task.Status == "terminada" || task.Status == "completed" || task.Status == "anulada")
-                        {
-                            await _firebaseService.IncrementYearlyStatsAsync(task.DriverId, task.CompletedAt ?? DateTime.UtcNow, "tasks");
-                            await _firebaseService.DeleteTaskAsync(task.Id);
-                            _logger.LogInformation("Tarefa {TaskId} concluída e removida do Firebase após sync.", task.Id);
-                        }
-                        else
-                        {
-                            await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
-                            _logger.LogInformation("Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Falha ao sincronizar tarefa {TaskId} para o SQL Server.", task.Id);
-                    }
                 }
 
                 _logger.LogInformation("A aguardar que a base de dados processe os logs antes de iniciar sync SQL -> Firebase...");
@@ -183,40 +175,6 @@ public class Worker : BackgroundService
                     _logger.LogInformation("Enviadas {Count} notificações do SQL para o Firebase.", sentCount);
                 }
 
-                // Sincronização de Mensagens enviadas pela Sede (Firebase -> SQL dbo.notification)
-                var pendingMessages = await _firebaseService.GetMessagesPendingSqlSyncAsync();
-                if (pendingMessages.Any())
-                {
-                    _logger.LogInformation("Mensagens pendentes de inserção no SQL: {Count}", pendingMessages.Count);
-                    foreach (var msg in pendingMessages)
-                    {
-                        var driverId = await _sqlService.GetDriverIdByFirebaseUidAsync(msg.DriverId);
-                        if (driverId.HasValue && driverId.Value > 0)
-                        {
-                            string sqlId = await _sqlService.InsertNotificationAsync(driverId.Value, msg);
-                            await _firebaseService.MarkMessageAsSyncedAsync(msg.Id, sqlId);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Não foi possível encontrar o motorista no SQL para o Firebase Uid {Uid}", msg.DriverId);
-                        }
-                    }
-                }
-
-                // Sincronização de estado de leitura das mensagens (App Motorista -> SQL ack=1)
-                var readMessages = await _firebaseService.GetMessagesPendingAckSyncAsync();
-                if (readMessages.Any())
-                {
-                    foreach (var msg in readMessages)
-                    {
-                        if (!string.IsNullOrEmpty(msg.SqlNotificationId))
-                        {
-                            await _sqlService.UpdateNotificationAckAsync(msg.SqlNotificationId, DateTime.UtcNow);
-                            await _firebaseService.MarkMessageAsAckedAsync(msg.Id);
-                        }
-                    }
-                }
-
                 // Limpeza de tarefas apagadas ou concluídas no SQL que ainda estão ativas no Firebase
                 if (DateTime.UtcNow - _lastTaskCleanupTime >= _taskCleanupInterval)
                 {
@@ -281,8 +239,103 @@ public class Worker : BackgroundService
                 _logger.LogError(ex, "Erro durante o ciclo de sincronização.");
             }
 
-            // Sync every 10 seconds for tasks
-            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+            // Sync every 30 seconds for SQL->Firebase tasks (highly optimized and completely cost-free on Firebase Reads)
+            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+        }
+
+        _logger.LogInformation("A parar os Real-Time Listeners do Firebase...");
+        try
+        {
+            if (_tasksListener != null) await _tasksListener.StopAsync();
+            if (_messagesListener != null) await _messagesListener.StopAsync();
+            if (_acksListener != null) await _acksListener.StopAsync();
+            _logger.LogInformation("Listeners do Firebase parados com sucesso.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao parar os Listeners do Firebase.");
+        }
+    }
+
+    private async Task OnPendingTasksReceivedAsync(List<TaskModel> pendingTasks)
+    {
+        _logger.LogInformation("[Listener] Recebidas {Count} tarefas pendentes de sincronização Firebase->SQL.", pendingTasks.Count);
+        foreach (var task in pendingTasks)
+        {
+            try
+            {
+                _logger.LogInformation("[Listener] A processar tarefa pendente: Firebase={Id}, SqlId={SqlId}, Status={Status}", task.Id, task.SqlId, task.Status);
+                var success = await _sqlService.ExecuteTaskStatusProcedureAsync(task);
+                if (success)
+                {
+                    if (task.Status == "terminada" || task.Status == "completed" || task.Status == "anulada")
+                    {
+                        await _firebaseService.IncrementYearlyStatsAsync(task.DriverId, task.CompletedAt ?? DateTime.UtcNow, "tasks");
+                        await _firebaseService.DeleteTaskAsync(task.Id);
+                        _logger.LogInformation("[Listener] Tarefa {TaskId} concluída e removida do Firebase após sync.", task.Id);
+                    }
+                    else
+                    {
+                        await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
+                        _logger.LogInformation("[Listener] Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning("[Listener] Falha ao sincronizar tarefa {TaskId} para o SQL Server.", task.Id);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Listener] Erro ao processar tarefa {TaskId} no callback.", task.Id);
+            }
+        }
+    }
+
+    private async Task OnPendingMessagesReceivedAsync(List<MessageFirebaseModel> pendingMessages)
+    {
+        _logger.LogInformation("[Listener] Recebidas {Count} mensagens pendentes de sincronização para o SQL.", pendingMessages.Count);
+        foreach (var msg in pendingMessages)
+        {
+            try
+            {
+                var driverId = await _sqlService.GetDriverIdByFirebaseUidAsync(msg.DriverId);
+                if (driverId.HasValue && driverId.Value > 0)
+                {
+                    string sqlId = await _sqlService.InsertNotificationAsync(driverId.Value, msg);
+                    await _firebaseService.MarkMessageAsSyncedAsync(msg.Id, sqlId);
+                    _logger.LogInformation("[Listener] Mensagem {MessageId} sincronizada para o SQL com ID {SqlId}.", msg.Id, sqlId);
+                }
+                else
+                {
+                    _logger.LogWarning("[Listener] Não foi possível encontrar o motorista no SQL para o Firebase Uid {Uid}", msg.DriverId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Listener] Erro ao sincronizar mensagem {MessageId} para o SQL.", msg.Id);
+            }
+        }
+    }
+
+    private async Task OnPendingAcksReceivedAsync(List<MessageFirebaseModel> readMessages)
+    {
+        _logger.LogInformation("[Listener] Recebidas {Count} confirmações de leitura (ACK) pendentes de sincronização para o SQL.", readMessages.Count);
+        foreach (var msg in readMessages)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(msg.SqlNotificationId))
+                {
+                    await _sqlService.UpdateNotificationAckAsync(msg.SqlNotificationId, DateTime.UtcNow);
+                    await _firebaseService.MarkMessageAsAckedAsync(msg.Id);
+                    _logger.LogInformation("[Listener] Confirmação de leitura da notificação {SqlNotificationId} sincronizada no SQL.", msg.SqlNotificationId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Listener] Erro ao sincronizar confirmação de leitura da mensagem {MessageId}.", msg.Id);
+            }
         }
     }
 }

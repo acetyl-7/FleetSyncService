@@ -29,6 +29,9 @@ public interface IFirebaseService
     Task<List<MessageFirebaseModel>> GetMessagesPendingAckSyncAsync();
     Task MarkMessageAsAckedAsync(string messageId);
     Task IncrementYearlyStatsAsync(string driverId, DateTime date, string type);
+    FirestoreChangeListener ListenToPendingTasks(Func<List<TaskModel>, Task> callback);
+    FirestoreChangeListener ListenToPendingMessages(Func<List<MessageFirebaseModel>, Task> callback);
+    FirestoreChangeListener ListenToPendingAcks(Func<List<MessageFirebaseModel>, Task> callback);
 }
 
 public class FirebaseService : IFirebaseService
@@ -491,5 +494,135 @@ public class FirebaseService : IFirebaseService
         };
         
         await docRef.SetAsync(updates, SetOptions.MergeAll);
+    }
+
+    public FirestoreChangeListener ListenToPendingTasks(Func<List<TaskModel>, Task> callback)
+    {
+        var query = _db.Collection("tasks").WhereEqualTo("needsSqlSync", true);
+        return query.Listen(async snapshot =>
+        {
+            var list = new List<TaskModel>();
+            foreach (var doc in snapshot.Documents)
+            {
+                if (!doc.Exists) continue;
+
+                DateTime? statusDate = null;
+                if (doc.ContainsField("statusDate"))
+                    statusDate = doc.GetValue<Timestamp>("statusDate").ToDateTime();
+                else if (doc.ContainsField("startedAt"))
+                    statusDate = doc.GetValue<Timestamp>("startedAt").ToDateTime();
+                else if (doc.ContainsField("completedAt"))
+                    statusDate = doc.GetValue<Timestamp>("completedAt").ToDateTime();
+
+                double? lat = null;
+                double? lon = null;
+                var status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty;
+
+                if (doc.ContainsField("startLocation"))
+                {
+                    var gp = doc.GetValue<GeoPoint>("startLocation");
+                    lat = gp.Latitude;
+                    lon = gp.Longitude;
+                }
+                if (doc.ContainsField("completeLocation"))
+                {
+                    var gp = doc.GetValue<GeoPoint>("completeLocation");
+                    lat = gp.Latitude;
+                    lon = gp.Longitude;
+                }
+                if (lat == null && doc.ContainsField("lat"))
+                    lat = doc.GetValue<double>("lat");
+                if (lon == null && doc.ContainsField("lon"))
+                    lon = doc.GetValue<double>("lon");
+
+                list.Add(new TaskModel
+                {
+                    Id = doc.Id,
+                    SqlId = doc.ContainsField("sqlId") ? doc.GetValue<string>("sqlId") : string.Empty,
+                    Status = status,
+                    StatusDate = statusDate,
+                    Lat = lat,
+                    Lon = lon,
+                    NeedsSqlSync = true,
+                    FleetcomTaskTypeId = doc.ContainsField("fleetcomTaskTypeId") ? (int?)doc.GetValue<long>("fleetcomTaskTypeId") : null,
+                    DriverId = doc.ContainsField("driverId") ? doc.GetValue<string>("driverId") : string.Empty,
+                    CompletedAt = statusDate
+                });
+            }
+
+            if (list.Count > 0)
+            {
+                await callback(list);
+            }
+        });
+    }
+
+    public FirestoreChangeListener ListenToPendingMessages(Func<List<MessageFirebaseModel>, Task> callback)
+    {
+        var query = _db.Collection("messages")
+                       .WhereEqualTo("sender", "hq")
+                       .WhereEqualTo("needsSqlSync", true);
+
+        return query.Listen(async snapshot =>
+        {
+            var list = new List<MessageFirebaseModel>();
+            foreach (var doc in snapshot.Documents)
+            {
+                if (!doc.Exists) continue;
+
+                DateTime? timestamp = null;
+                if (doc.ContainsField("timestamp"))
+                {
+                    timestamp = doc.GetValue<Timestamp>("timestamp").ToDateTime();
+                }
+
+                list.Add(new MessageFirebaseModel
+                {
+                    Id = doc.Id,
+                    Text = doc.ContainsField("text") ? doc.GetValue<string>("text") : string.Empty,
+                    Sender = doc.ContainsField("sender") ? doc.GetValue<string>("sender") : string.Empty,
+                    DriverId = doc.ContainsField("driverId") ? doc.GetValue<string>("driverId") : string.Empty,
+                    Status = doc.ContainsField("status") ? doc.GetValue<string>("status") : string.Empty,
+                    Type = doc.ContainsField("type") ? doc.GetValue<string>("type") : string.Empty,
+                    Timestamp = timestamp,
+                    NeedsSqlSync = true
+                });
+            }
+
+            if (list.Count > 0)
+            {
+                await callback(list);
+            }
+        });
+    }
+
+    public FirestoreChangeListener ListenToPendingAcks(Func<List<MessageFirebaseModel>, Task> callback)
+    {
+        var query = _db.Collection("messages")
+                       .WhereEqualTo("sender", "hq")
+                       .WhereEqualTo("status", "read")
+                       .WhereEqualTo("sqlAck", false);
+
+        return query.Listen(async snapshot =>
+        {
+            var list = new List<MessageFirebaseModel>();
+            foreach (var doc in snapshot.Documents)
+            {
+                if (!doc.Exists) continue;
+
+                var data = doc.ToDictionary();
+                list.Add(new MessageFirebaseModel
+                {
+                    Id = doc.Id,
+                    SqlNotificationId = data.ContainsKey("sqlNotificationId") ? data["sqlNotificationId"]?.ToString() : null,
+                    Status = "read"
+                });
+            }
+
+            if (list.Count > 0)
+            {
+                await callback(list);
+            }
+        });
     }
 }

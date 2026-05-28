@@ -74,7 +74,7 @@ public class SqlService : ISqlService
                 ISNULL(tt.fleetcomName, '') AS taskTypeName
             FROM dbo.task t
             LEFT JOIN dbo.task_type tt ON t.fleetcomTaskTypeId = tt.fleetcomId
-            WHERE t.deleted IS NULL AND t.status < 80";
+            WHERE t.deleted IS NULL AND t.status < 80 AND t.replicationStatus = 1";
         return await connection.QueryAsync<TaskSqlModel>(query);
     }
 
