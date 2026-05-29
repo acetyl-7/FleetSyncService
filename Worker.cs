@@ -93,6 +93,21 @@ public class Worker : BackgroundService
                         }
                     }
                     _logger.LogInformation("Sincronização concluída: {Count} motoristas processados para SQL.", syncedCount);
+
+                    // Sincronização SQL → Firebase: Enviar todos os motoristas do SQL para o Firebase
+                    // para que a app móvel possa validar telemóveis diretamente no Firestore
+                    var sqlDrivers = await _sqlService.GetActiveDriversAsync();
+                    int driversSynced = 0;
+                    foreach (var driver in sqlDrivers)
+                    {
+                        await _firebaseService.UpsertCompanyDriverAsync(driver);
+                        driversSynced++;
+                    }
+                    if (driversSynced > 0)
+                    {
+                        _logger.LogInformation("Sincronizados {Count} motoristas do SQL para o Firebase.", driversSynced);
+                    }
+
                     _lastUserSyncTime = DateTime.UtcNow;
                 }
 

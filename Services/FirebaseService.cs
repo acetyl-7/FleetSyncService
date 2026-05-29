@@ -13,6 +13,7 @@ public interface IFirebaseService
     bool IsEnabled { get; }
     Task<FirestoreDb> GetDatabaseAsync();
     Task UpsertDriverAsync(DriverSqlModel sqlDriver);
+    Task UpsertCompanyDriverAsync(DriverSqlModel sqlDriver);
     Task UpsertTaskAsync(TaskSqlModel sqlTask);
     Task UpsertMessageAsync(MessageFirebaseModel msg);
     void StartTasksListener(Func<Guid, string, DateTime, Task> onTaskUpdatedCallback, ILogger logger);
@@ -118,6 +119,32 @@ public class FirebaseService : IFirebaseService
                 data.Add("isAuthorized", false);
             }
         }
+
+        await docRef.SetAsync(data, SetOptions.MergeAll);
+    }
+
+    /// <summary>
+    /// Escreve na coleção 'company_drivers' apenas os dados mínimos para validação de telemóvel.
+    /// Esta coleção é separada da 'users' para não a poluir com motoristas que nunca usaram a app.
+    /// </summary>
+    public async Task UpsertCompanyDriverAsync(DriverSqlModel sqlDriver)
+    {
+        // Normalizar o telemóvel: só dígitos, sem prefixo 351
+        var phone = new string((sqlDriver.TelemovelEmpresa ?? "").Where(char.IsDigit).ToArray());
+        if (phone.StartsWith("351") && phone.Length > 9)
+        {
+            phone = phone.Substring(3);
+        }
+
+        if (string.IsNullOrEmpty(phone)) return;
+
+        var docRef = _db.Collection("company_drivers").Document(sqlDriver.Id.ToString());
+        var data = new Dictionary<string, object>
+        {
+            { "sqlId", sqlDriver.Id.ToString() },
+            { "nickname", sqlDriver.Alcunha ?? "" },
+            { "companyPhone", phone }
+        };
 
         await docRef.SetAsync(data, SetOptions.MergeAll);
     }
