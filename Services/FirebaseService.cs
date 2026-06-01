@@ -33,6 +33,26 @@ public interface IFirebaseService
     FirestoreChangeListener ListenToPendingTasks(Func<List<TaskModel>, Task> callback);
     FirestoreChangeListener ListenToPendingMessages(Func<List<MessageFirebaseModel>, Task> callback);
     FirestoreChangeListener ListenToPendingAcks(Func<List<MessageFirebaseModel>, Task> callback);
+
+    // Novos métodos de Sincronização e Limpeza periódica
+    Task<List<AbastecimentoFirestoreModel>> GetPendingRefuelsAsync();
+    Task MarkRefuelAsSyncedAsync(string id);
+    Task DeleteRefuelAsync(string id);
+    Task<List<IncidentFirestoreModel>> GetPendingIncidentsAsync();
+    Task MarkIncidentAsSyncedAsync(string id);
+    Task DeleteIncidentAsync(string id);
+    Task DeleteMessageAsync(string id);
+    Task UpdateDriverSyncErrorAsync(string driverUid, string syncError);
+    Task<int> GetUnsyncedTasksForDriverCountAsync(string driverUid, string sqlDriverId);
+    Task<int> GetUnsyncedMessagesForDriverCountAsync(string driverUid);
+    Task<int> GetUnsyncedRefuelsForDriverCountAsync(string driverUid);
+    Task<int> GetUnsyncedIncidentsForDriverCountAsync(string driverUid);
+    Task<string> GetLastCleanupDateAsync();
+    Task SetLastCleanupDateAsync(string dateStr);
+    Task<List<TaskModel>> GetSyncedTasksForDriverAsync(string driverUid, string sqlDriverId);
+    Task<List<AbastecimentoFirestoreModel>> GetSyncedRefuelsForDriverAsync(string driverUid);
+    Task<List<IncidentFirestoreModel>> GetSyncedIncidentsForDriverAsync(string driverUid);
+    Task<List<MessageFirebaseModel>> GetSyncedMessagesForDriverAsync(string driverUid);
 }
 
 public class FirebaseService : IFirebaseService
@@ -651,5 +671,367 @@ public class FirebaseService : IFirebaseService
                 await callback(list);
             }
         });
+    }
+
+    public async Task<List<AbastecimentoFirestoreModel>> GetPendingRefuelsAsync()
+    {
+        var snapshot = await _db.Collection("refuels")
+                                .WhereEqualTo("status", "approved")
+                                .GetSnapshotAsync();
+        
+        var list = new List<AbastecimentoFirestoreModel>();
+        foreach (var doc in snapshot.Documents)
+        {
+            if (!doc.Exists) continue;
+            var data = doc.ToDictionary();
+            
+            // Se sqlSynced for true, ignoramos (já sincronizado)
+            if (data.TryGetValue("sqlSynced", out var synced) && synced is bool b && b)
+                continue;
+
+            DateTime ts = DateTime.UtcNow;
+            if (data.TryGetValue("timestamp", out var tsVal) && tsVal is Timestamp t)
+                ts = t.ToDateTime();
+
+            decimal lat = 0;
+            decimal lon = 0;
+            if (data.TryGetValue("location", out var locVal) && locVal is GeoPoint gp)
+            {
+                lat = (decimal)gp.Latitude;
+                lon = (decimal)gp.Longitude;
+            }
+
+            decimal liters = 0;
+            if (data.TryGetValue("liters", out var litVal))
+            {
+                if (litVal is double d) liters = (decimal)d;
+                else if (litVal is long l) liters = (decimal)l;
+            }
+
+            int kms = 0;
+            if (data.TryGetValue("kms", out var kmsVal))
+            {
+                if (kmsVal is long l) kms = (int)l;
+                else if (kmsVal is string s && int.TryParse(s, out var parsedKms)) kms = parsedKms;
+            }
+
+            list.Add(new AbastecimentoFirestoreModel
+            {
+                Id = doc.Id,
+                DriverId = data.TryGetValue("driverId", out var drId) ? drId?.ToString() ?? "" : "",
+                Plate = data.TryGetValue("plate", out var pl) ? pl?.ToString() ?? "" : "",
+                TrailerPlate = data.TryGetValue("trailerPlate", out var trPl) ? trPl?.ToString() ?? "" : "",
+                Liters = liters,
+                FuelType = data.TryGetValue("fuelType", out var fTy) ? fTy?.ToString() ?? "" : "",
+                FullTank = data.TryGetValue("fullTank", out var fTa) && fTa is bool full && full,
+                Notes = data.TryGetValue("notes", out var nt) ? nt?.ToString() ?? "" : "",
+                ReceiptUrl = data.TryGetValue("receiptUrl", out var rUrl) ? rUrl?.ToString() ?? "" : "",
+                Lat = lat,
+                Lon = lon,
+                Kms = kms,
+                Timestamp = ts,
+                Status = data.TryGetValue("status", out var st) ? st?.ToString() ?? "" : "",
+                SqlSynced = false
+            });
+        }
+        return list;
+    }
+
+    public async Task MarkRefuelAsSyncedAsync(string id)
+    {
+        var docRef = _db.Collection("refuels").Document(id);
+        await docRef.SetAsync(new Dictionary<string, object> { { "sqlSynced", true } }, SetOptions.MergeAll);
+    }
+
+    public async Task DeleteRefuelAsync(string id)
+    {
+        var docRef = _db.Collection("refuels").Document(id);
+        await docRef.DeleteAsync();
+    }
+
+    public async Task<List<IncidentFirestoreModel>> GetPendingIncidentsAsync()
+    {
+        var snapshot = await _db.Collection("incidents")
+                                .WhereEqualTo("status", "approved")
+                                .GetSnapshotAsync();
+        
+        var list = new List<IncidentFirestoreModel>();
+        foreach (var doc in snapshot.Documents)
+        {
+            if (!doc.Exists) continue;
+            var data = doc.ToDictionary();
+            
+            // Se sqlSynced for true, ignoramos (já sincronizado)
+            if (data.TryGetValue("sqlSynced", out var synced) && synced is bool b && b)
+                continue;
+
+            DateTime ts = DateTime.UtcNow;
+            if (data.TryGetValue("timestamp", out var tsVal) && tsVal is Timestamp t)
+                ts = t.ToDateTime();
+
+            decimal lat = 0;
+            decimal lon = 0;
+            if (data.TryGetValue("location", out var locVal) && locVal is GeoPoint gp)
+            {
+                lat = (decimal)gp.Latitude;
+                lon = (decimal)gp.Longitude;
+            }
+
+            int kms = 0;
+            if (data.TryGetValue("kms", out var kmsVal))
+            {
+                if (kmsVal is long l) kms = (int)l;
+                else if (kmsVal is string s && int.TryParse(s, out var parsedKms)) kms = parsedKms;
+            }
+
+            var imageUrlsList = new List<string>();
+            if (data.TryGetValue("imageUrls", out var imgs) && imgs is System.Collections.IEnumerable enumerable)
+            {
+                foreach (var img in enumerable)
+                {
+                    if (img != null) imageUrlsList.Add(img.ToString()!);
+                }
+            }
+
+            list.Add(new IncidentFirestoreModel
+            {
+                Id = doc.Id,
+                DriverId = data.TryGetValue("driverId", out var drId) ? drId?.ToString() ?? "" : "",
+                Plate = data.TryGetValue("plate", out var pl) ? pl?.ToString() ?? "" : "",
+                Description = data.TryGetValue("description", out var desc) ? desc?.ToString() ?? "" : "",
+                ImageUrls = imageUrlsList,
+                Lat = lat,
+                Lon = lon,
+                Kms = kms,
+                Timestamp = ts,
+                Type = data.TryGetValue("type", out var ty) ? ty?.ToString() ?? "" : "",
+                CustomReason = data.TryGetValue("customReason", out var cr) ? cr?.ToString() ?? "" : "",
+                Status = data.TryGetValue("status", out var st) ? st?.ToString() ?? "" : "",
+                SqlSynced = false
+            });
+        }
+        return list;
+    }
+
+    public async Task MarkIncidentAsSyncedAsync(string id)
+    {
+        var docRef = _db.Collection("incidents").Document(id);
+        await docRef.SetAsync(new Dictionary<string, object> { { "sqlSynced", true } }, SetOptions.MergeAll);
+    }
+
+    public async Task DeleteIncidentAsync(string id)
+    {
+        var docRef = _db.Collection("incidents").Document(id);
+        await docRef.DeleteAsync();
+    }
+
+    public async Task DeleteMessageAsync(string id)
+    {
+        var docRef = _db.Collection("messages").Document(id);
+        await docRef.DeleteAsync();
+    }
+
+    public async Task UpdateDriverSyncErrorAsync(string driverUid, string syncError)
+    {
+        var docRef = _db.Collection("users").Document(driverUid);
+        await docRef.SetAsync(new Dictionary<string, object> { { "syncError", syncError } }, SetOptions.MergeAll);
+    }
+
+    public async Task<int> GetUnsyncedTasksForDriverCountAsync(string driverUid, string sqlDriverId)
+    {
+        var searchIds = new List<string> { driverUid };
+        if (!string.IsNullOrEmpty(sqlDriverId)) searchIds.Add(sqlDriverId);
+
+        int totalCount = 0;
+        foreach (var id in searchIds)
+        {
+            var snap = await _db.Collection("tasks")
+                                .WhereEqualTo("driverId", id)
+                                .WhereEqualTo("needsSqlSync", true)
+                                .GetSnapshotAsync();
+            totalCount += snap.Count;
+        }
+        return totalCount;
+    }
+
+    public async Task<int> GetUnsyncedMessagesForDriverCountAsync(string driverUid)
+    {
+        var snap = await _db.Collection("messages")
+                            .WhereEqualTo("driverId", driverUid)
+                            .WhereEqualTo("needsSqlSync", true)
+                            .GetSnapshotAsync();
+        return snap.Count;
+    }
+
+    public async Task<int> GetUnsyncedRefuelsForDriverCountAsync(string driverUid)
+    {
+        var snap = await _db.Collection("refuels")
+                            .WhereEqualTo("driverId", driverUid)
+                            .WhereEqualTo("status", "approved")
+                            .GetSnapshotAsync();
+        
+        int count = 0;
+        foreach (var doc in snap.Documents)
+        {
+            if (doc.Exists && (!doc.ContainsField("sqlSynced") || doc.GetValue<bool>("sqlSynced") != true))
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public async Task<int> GetUnsyncedIncidentsForDriverCountAsync(string driverUid)
+    {
+        var snap = await _db.Collection("incidents")
+                            .WhereEqualTo("driverId", driverUid)
+                            .WhereEqualTo("status", "approved")
+                            .GetSnapshotAsync();
+        
+        int count = 0;
+        foreach (var doc in snap.Documents)
+        {
+            if (doc.Exists && (!doc.ContainsField("sqlSynced") || doc.GetValue<bool>("sqlSynced") != true))
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public async Task<string> GetLastCleanupDateAsync()
+    {
+        var docRef = _db.Collection("config").Document("cleanup");
+        var snap = await docRef.GetSnapshotAsync();
+        if (snap.Exists && snap.ContainsField("lastRunDate"))
+        {
+            return snap.GetValue<string>("lastRunDate") ?? "";
+        }
+        return "";
+    }
+
+    public async Task SetLastCleanupDateAsync(string dateStr)
+    {
+        var docRef = _db.Collection("config").Document("cleanup");
+        await docRef.SetAsync(new Dictionary<string, object> { { "lastRunDate", dateStr } }, SetOptions.MergeAll);
+    }
+
+    public async Task<List<TaskModel>> GetSyncedTasksForDriverAsync(string driverUid, string sqlDriverId)
+    {
+        var searchIds = new List<string> { driverUid };
+        if (!string.IsNullOrEmpty(sqlDriverId)) searchIds.Add(sqlDriverId);
+
+        var list = new List<TaskModel>();
+        foreach (var id in searchIds)
+        {
+            var snap = await _db.Collection("tasks")
+                               .WhereEqualTo("driverId", id)
+                               .GetSnapshotAsync();
+           
+            foreach (var doc in snap.Documents)
+            {
+                if (!doc.Exists) continue;
+                var status = doc.ContainsField("status") ? doc.GetValue<string>("status") : "";
+                var needsSqlSync = doc.ContainsField("needsSqlSync") && doc.GetValue<bool>("needsSqlSync");
+                var sqlId = doc.ContainsField("sqlId") ? doc.GetValue<string>("sqlId") : "";
+               
+                var isCompleted = status == "completed" || status == "terminada" || status == "anulada";
+               
+                if (isCompleted && !needsSqlSync && !string.IsNullOrEmpty(sqlId))
+                {
+                    DateTime? completedAt = null;
+                    if (doc.ContainsField("completedAt")) completedAt = doc.GetValue<Timestamp>("completedAt").ToDateTime();
+                    else if (doc.ContainsField("date")) completedAt = doc.GetValue<Timestamp>("date").ToDateTime();
+                    else if (doc.ContainsField("timestamp")) completedAt = doc.GetValue<Timestamp>("timestamp").ToDateTime();
+
+                    list.Add(new TaskModel
+                    {
+                        Id = doc.Id,
+                        SqlId = sqlId,
+                        Status = status,
+                        CompletedAt = completedAt,
+                        StatusDate = completedAt
+                    });
+                }
+            }
+        }
+        return list;
+    }
+
+    public async Task<List<AbastecimentoFirestoreModel>> GetSyncedRefuelsForDriverAsync(string driverUid)
+    {
+        var snap = await _db.Collection("refuels")
+                            .WhereEqualTo("driverId", driverUid)
+                            .WhereEqualTo("status", "approved")
+                            .GetSnapshotAsync();
+       
+        var list = new List<AbastecimentoFirestoreModel>();
+        foreach (var doc in snap.Documents)
+        {
+            if (doc.Exists && doc.ContainsField("sqlSynced") && doc.GetValue<bool>("sqlSynced") == true)
+            {
+                DateTime timestamp = DateTime.UtcNow;
+                if (doc.ContainsField("timestamp")) timestamp = doc.GetValue<Timestamp>("timestamp").ToDateTime();
+
+                list.Add(new AbastecimentoFirestoreModel
+                {
+                    Id = doc.Id,
+                    DriverId = driverUid,
+                    Timestamp = timestamp
+                });
+            }
+        }
+        return list;
+    }
+
+    public async Task<List<IncidentFirestoreModel>> GetSyncedIncidentsForDriverAsync(string driverUid)
+    {
+        var snap = await _db.Collection("incidents")
+                            .WhereEqualTo("driverId", driverUid)
+                            .WhereEqualTo("status", "approved")
+                            .GetSnapshotAsync();
+       
+        var list = new List<IncidentFirestoreModel>();
+        foreach (var doc in snap.Documents)
+        {
+            if (doc.Exists && doc.ContainsField("sqlSynced") && doc.GetValue<bool>("sqlSynced") == true)
+            {
+                DateTime timestamp = DateTime.UtcNow;
+                if (doc.ContainsField("timestamp")) timestamp = doc.GetValue<Timestamp>("timestamp").ToDateTime();
+
+                list.Add(new IncidentFirestoreModel
+                {
+                    Id = doc.Id,
+                    DriverId = driverUid,
+                    Timestamp = timestamp
+                });
+            }
+        }
+        return list;
+    }
+
+    public async Task<List<MessageFirebaseModel>> GetSyncedMessagesForDriverAsync(string driverUid)
+    {
+        var snap = await _db.Collection("messages")
+                            .WhereEqualTo("driverId", driverUid)
+                            .GetSnapshotAsync();
+       
+        var list = new List<MessageFirebaseModel>();
+        foreach (var doc in snap.Documents)
+        {
+            if (!doc.Exists) continue;
+            var needsSqlSync = doc.ContainsField("needsSqlSync") && doc.GetValue<bool>("needsSqlSync");
+            var sqlNotificationId = doc.ContainsField("sqlNotificationId") ? doc.GetValue<string>("sqlNotificationId") : "";
+           
+            if (!needsSqlSync && !string.IsNullOrEmpty(sqlNotificationId))
+            {
+                list.Add(new MessageFirebaseModel
+                {
+                    Id = doc.Id,
+                    DriverId = driverUid
+                });
+            }
+        }
+        return list;
     }
 }

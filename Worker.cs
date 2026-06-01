@@ -1,4 +1,5 @@
 using System.Linq;
+using System.Net.Http;
 using FleetSyncService.Services;
 using FleetSyncService.Models;
 using Google.Cloud.Firestore;
@@ -62,6 +63,210 @@ public class Worker : BackgroundService
                 }
 
                 _logger.LogInformation("Sync Service a correr");
+
+                // A. Sincronização de Abastecimentos (Firebase -> SQL)
+                _logger.LogInformation("A verificar abastecimentos pendentes de sincronização...");
+                try
+                {
+                    var pendingRefuels = await _firebaseService.GetPendingRefuelsAsync();
+                    foreach (var refuel in pendingRefuels)
+                    {
+                        var driverIdVal = await _sqlService.GetDriverIdByFirebaseUidAsync(refuel.DriverId);
+                        if (driverIdVal.HasValue && driverIdVal.Value > 0)
+                        {
+                            byte[]? imageBytes = null;
+                            if (!string.IsNullOrEmpty(refuel.ReceiptUrl))
+                            {
+                                try
+                                {
+                                    using var httpClient = new HttpClient();
+                                    imageBytes = await httpClient.GetByteArrayAsync(refuel.ReceiptUrl);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Erro ao descarregar imagem de abastecimento: {Url}", refuel.ReceiptUrl);
+                                }
+                            }
+
+                            var model = new AbastecimentoModel
+                            {
+                                DtReal = refuel.Timestamp,
+                                DtUser = refuel.Timestamp,
+                                MobileDriverId = driverIdVal.Value.ToString(),
+                                Lat = refuel.Lat,
+                                Lon = refuel.Lon,
+                                Kms = refuel.Kms,
+                                Litros = refuel.Liters,
+                                MatTractor = refuel.Plate,
+                                MatReboque = refuel.TrailerPlate,
+                                TipoCartao = "",
+                                Nota = refuel.Notes,
+                                Imagem = imageBytes,
+                                TipoProd = refuel.FuelType,
+                                Atesto = refuel.FullTank
+                            };
+
+                            var success = await _sqlService.ExecuteProcessaAbastecimentoProcedureAsync(model);
+                            if (success)
+                            {
+                                await _firebaseService.MarkRefuelAsSyncedAsync(refuel.Id);
+                                _logger.LogInformation("Abastecimento {Id} sincronizado com sucesso para o SQL Server.", refuel.Id);
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Erro ao processar sincronização de abastecimentos.");
+                }
+
+                // B. Sincronização de Incidentes (Firebase -> SQL)
+                _logger.LogInformation("A verificar incidentes pendentes de sincronização...");
+                try
+                {
+                    var pendingIncidents = await _firebaseService.GetPendingIncidentsAsync();
+                    foreach (var incident in pendingIncidents)
+                    {
+                        var driverIdVal = await _sqlService.GetDriverIdByFirebaseUidAsync(incident.DriverId);
+                        if (driverIdVal.HasValue && driverIdVal.Value > 0)
+                        {
+                            var model = new IncidentModel
+                            {
+                                DtIncidente = incident.Timestamp,
+                                DtUser = incident.Timestamp,
+                                MobileDriverId = driverIdVal.Value.ToString(),
+                                Lat = incident.Lat,
+                                Lon = incident.Lon,
+                                Kms = incident.Kms,
+                                MatTractor = incident.Plate,
+                                MatReboque = "",
+                                ImageIds = string.Join(",", incident.ImageUrls),
+                                Descricao = incident.Description,
+                                Tipo = incident.Type,
+                                RazaoCustom = incident.CustomReason
+                            };
+
+                            var success = await _sqlService.ExecuteProcessaIncidenteProcedureAsync(model);
+                            if (success)
+                            {
+                                await _firebaseService.MarkIncidentAsSyncedAsync(incident.Id);
+                                _logger.LogInformation("Incidente {Id} sincronizado com sucesso para o SQL Server.", incident.Id);
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Erro ao processar sincronização de incidentes.");
+                }
+
+                // C. Verificação de Erros de Sincronização (syncError)
+                _logger.LogInformation("A recalcular estado de sincronização (syncError) dos motoristas...");
+                try
+                {
+                    var fbUsers = await _firebaseService.GetAuthorizedDriversAsync();
+                    foreach (var user in fbUsers)
+                    {
+                        var errors = new List<string>();
+
+                        var unsyncedTasks = await _firebaseService.GetUnsyncedTasksForDriverCountAsync(user.Uid, user.SqlId);
+                        if (unsyncedTasks > 0) errors.Add("tarefas");
+
+                        var unsyncedMessages = await _firebaseService.GetUnsyncedMessagesForDriverCountAsync(user.Uid);
+                        if (unsyncedMessages > 0) errors.Add("mensagens");
+
+                        var unsyncedRefuels = await _firebaseService.GetUnsyncedRefuelsForDriverCountAsync(user.Uid);
+                        if (unsyncedRefuels > 0) errors.Add("abastecimento");
+
+                        var unsyncedIncidents = await _firebaseService.GetUnsyncedIncidentsForDriverCountAsync(user.Uid);
+                        if (unsyncedIncidents > 0) errors.Add("incidente");
+
+                        string syncErrorText = "All in sync";
+                        if (errors.Count > 0)
+                        {
+                            syncErrorText = "Falta sincronizar " + string.Join(", ", errors);
+                        }
+
+                        await _firebaseService.UpdateDriverSyncErrorAsync(user.Uid, syncErrorText);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Erro ao atualizar estado de sincronização dos motoristas.");
+                }
+
+                // D. Cleanup semanal de segundas-feiras às 00:00 UTC
+                if (DateTime.UtcNow.DayOfWeek == DayOfWeek.Monday && DateTime.UtcNow.Hour == 0)
+                {
+                    try
+                    {
+                        var todayStr = DateTime.UtcNow.ToString("yyyy-MM-dd");
+                        var lastRun = await _firebaseService.GetLastCleanupDateAsync();
+                        
+                        if (lastRun != todayStr)
+                        {
+                            _logger.LogInformation("A iniciar o cleanup semanal das segundas-feiras...");
+                            var fbUsers = await _firebaseService.GetAuthorizedDriversAsync();
+                            foreach (var user in fbUsers)
+                            {
+                                // 1. Limpar tarefas
+                                var tasksToClean = await _firebaseService.GetSyncedTasksForDriverAsync(user.Uid, user.SqlId);
+                                foreach (var task in tasksToClean)
+                                {
+                                    var completionDate = task.CompletedAt ?? task.StatusDate ?? DateTime.UtcNow;
+                                    await _firebaseService.IncrementYearlyStatsAsync(user.Uid, completionDate, "tasks");
+                                    await _firebaseService.DeleteTaskAsync(task.Id);
+                                }
+
+                                // 2. Limpar refuels
+                                var refuelsToClean = await _firebaseService.GetSyncedRefuelsForDriverAsync(user.Uid);
+                                foreach (var refuel in refuelsToClean)
+                                {
+                                    await _firebaseService.IncrementYearlyStatsAsync(user.Uid, refuel.Timestamp, "refuels");
+                                    await _firebaseService.DeleteRefuelAsync(refuel.Id);
+                                }
+
+                                // 3. Limpar incidents
+                                var incidentsToClean = await _firebaseService.GetSyncedIncidentsForDriverAsync(user.Uid);
+                                foreach (var incident in incidentsToClean)
+                                {
+                                    await _firebaseService.IncrementYearlyStatsAsync(user.Uid, incident.Timestamp, "incidents");
+                                    await _firebaseService.DeleteIncidentAsync(incident.Id);
+                                }
+
+                                // 4. Limpar messages
+                                var messagesToClean = await _firebaseService.GetSyncedMessagesForDriverAsync(user.Uid);
+                                foreach (var message in messagesToClean)
+                                {
+                                    await _firebaseService.DeleteMessageAsync(message.Id);
+                                }
+                            }
+                            
+                            await _firebaseService.SetLastCleanupDateAsync(todayStr);
+                            _logger.LogInformation("Cleanup semanal concluído com sucesso!");
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Erro no ciclo de cleanup semanal.");
+                    }
+                }
 
                 // 0. Sincronização: Firebase (Firestore) -> SQL (dbo.driver)
                 // Corre apenas de X em X minutos para poupar recursos, já que os motoristas não mudam a toda a hora
@@ -249,13 +454,24 @@ public class Worker : BackgroundService
                     _lastTaskCleanupTime = DateTime.UtcNow;
                 }
             }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("O ciclo de sincronização foi cancelado (serviço a parar).");
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Erro durante o ciclo de sincronização.");
             }
 
-            // Sync every 30 seconds for SQL->Firebase tasks (highly optimized and completely cost-free on Firebase Reads)
-            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            try
+            {
+                // Sync every 30 seconds for SQL->Firebase tasks (highly optimized and completely cost-free on Firebase Reads)
+                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancelamento normal durante a paragem do serviço, sairá do ciclo naturalmente
+            }
         }
 
         _logger.LogInformation("A parar os Real-Time Listeners do Firebase...");
@@ -283,17 +499,10 @@ public class Worker : BackgroundService
                 var success = await _sqlService.ExecuteTaskStatusProcedureAsync(task);
                 if (success)
                 {
-                    if (task.Status == "terminada" || task.Status == "completed" || task.Status == "anulada")
-                    {
-                        await _firebaseService.IncrementYearlyStatsAsync(task.DriverId, task.CompletedAt ?? DateTime.UtcNow, "tasks");
-                        await _firebaseService.DeleteTaskAsync(task.Id);
-                        _logger.LogInformation("[Listener] Tarefa {TaskId} concluída e removida do Firebase após sync.", task.Id);
-                    }
-                    else
-                    {
-                        await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
-                        _logger.LogInformation("[Listener] Tarefa {TaskId} sincronizada com sucesso para o SQL Server.", task.Id);
-                    }
+                    // Apenas marcar a tarefa como sincronizada para o SQL, mantendo o documento no Firebase
+                    // para que o Backoffice consiga exibir o histórico e as imagens associadas.
+                    await _firebaseService.MarkTaskAsSyncedAsync(task.Id);
+                    _logger.LogInformation("[Listener] Tarefa {TaskId} sincronizada com sucesso para o SQL Server (Estado: {Status}).", task.Id, task.Status);
                 }
                 else
                 {
