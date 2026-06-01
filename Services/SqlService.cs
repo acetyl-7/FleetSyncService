@@ -54,7 +54,7 @@ public class SqlService : ISqlService
     public async Task<IEnumerable<DriverSqlModel>> GetActiveDriversAsync()
     {
         using var connection = new SqlConnection(_connectionString);
-        return await connection.QueryAsync<DriverSqlModel>("SELECT ID, ID_EMPRESA as IdEmpresa, NOME, ALCUNHA, TELEMOVEL, TELEMOVEL_EMPRESA as TelemovelEmpresa, EMAIL as Email, FIREBASE_UID as FirebaseUid FROM dbo.v_motorista_todos");
+        return await connection.QueryAsync<DriverSqlModel>("SELECT ID, ID_EMPRESA as IdEmpresa, NOME, ALCUNHA, TELEMOVEL, TELEMOVEL_EMPRESA as TelemovelEmpresa, EMAIL as Email FROM dbo.v_motorista_todos");
     }
 
     public async Task<IEnumerable<TaskSqlModel>> GetActiveTasksAsync()
