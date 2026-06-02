@@ -385,7 +385,7 @@ public class SqlService : ISqlService
             OUTPUT INSERTED.id
             VALUES (
                 NULL, @FleetcomDriverId, 1, @Date, 'Mensagem', @Body,
-                NULL, 0, NULL, 0, 0, NULL, NULL,
+                NULL, 0, NULL, 1, 0, @Date, NULL,
                 @Date, NULL, NULL, 1,
                 0, NULL, NULL
             );";

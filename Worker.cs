@@ -33,8 +33,12 @@ public class Worker : BackgroundService
         _logger = logger;
         _firebaseService = firebaseService;
         _sqlService = sqlService;
-    }    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await Task.Yield(); // Evita bloquear o Windows Service Control Manager (SCM) durante o arranque inicial
+
         if (_firebaseService.IsEnabled)
         {
             _logger.LogInformation("A inicializar os Real-Time Listeners do Firebase...");
