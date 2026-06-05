@@ -298,7 +298,8 @@ public class FirebaseService : IFirebaseService
                 Name = doc.ContainsField("name") ? doc.GetValue<string>("name") : string.Empty,
                 Nickname = doc.ContainsField("nickname") ? doc.GetValue<string>("nickname") : string.Empty,
                 Phone = doc.ContainsField("phone") ? doc.GetValue<string>("phone") : string.Empty,
-                Email = doc.ContainsField("email") ? doc.GetValue<string>("email") : string.Empty
+                Email = doc.ContainsField("email") ? doc.GetValue<string>("email") : string.Empty,
+                SyncError = doc.ContainsField("syncError") ? doc.GetValue<string>("syncError") : string.Empty
             });
         }
         return list;
@@ -337,7 +338,8 @@ public class FirebaseService : IFirebaseService
                 Name = name,
                 Nickname = nickname,
                 Phone = doc.ContainsField("phone") ? doc.GetValue<string>("phone") : string.Empty,
-                Email = doc.ContainsField("email") ? doc.GetValue<string>("email") : string.Empty
+                Email = doc.ContainsField("email") ? doc.GetValue<string>("email") : string.Empty,
+                SyncError = doc.ContainsField("syncError") ? doc.GetValue<string>("syncError") : string.Empty
             });
         }
         return list;

@@ -8,4 +8,5 @@ public class DriverFirebaseModel
     public string Nickname { get; set; } = string.Empty;
     public string Phone { get; set; } = string.Empty;
     public string Email { get; set; } = string.Empty;
+    public string SyncError { get; set; } = string.Empty;
 }

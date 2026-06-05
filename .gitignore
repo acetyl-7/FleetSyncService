@@ -430,3 +430,5 @@ FodyWeavers.xsd
 
 # Custom
 service-account.json
+service-account-logichat.json
+*.ps1

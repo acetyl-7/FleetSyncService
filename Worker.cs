@@ -28,6 +28,10 @@ public class Worker : BackgroundService
     private DateTime _lastTaskCleanupTime = DateTime.MinValue;
     private readonly TimeSpan _taskCleanupInterval = TimeSpan.FromMinutes(5);
 
+    // Controlo de tempo para recalcular erros de sincronização (syncError) para os motoristas
+    private DateTime _lastSyncErrorCalculationTime = DateTime.MinValue;
+    private readonly TimeSpan _syncErrorCalculationInterval = TimeSpan.FromMinutes(5);
+
     public Worker(ILogger<Worker> logger, IFirebaseService firebaseService, ISqlService sqlService)
     {
         _logger = logger;
@@ -172,43 +176,53 @@ public class Worker : BackgroundService
                     _logger.LogError(ex, "Erro ao processar sincronização de incidentes.");
                 }
 
-                // C. Verificação de Erros de Sincronização (syncError)
-                _logger.LogInformation("A recalcular estado de sincronização (syncError) dos motoristas...");
-                try
+                // C. Verificação de Erros de Sincronização (syncError) - Otimizado para correr a cada 5 minutos
+                if (DateTime.UtcNow - _lastSyncErrorCalculationTime >= _syncErrorCalculationInterval)
                 {
-                    var fbUsers = await _firebaseService.GetAuthorizedDriversAsync();
-                    foreach (var user in fbUsers)
+                    _logger.LogInformation("A recalcular estado de sincronização (syncError) dos motoristas...");
+                    try
                     {
-                        var errors = new List<string>();
-
-                        var unsyncedTasks = await _firebaseService.GetUnsyncedTasksForDriverCountAsync(user.Uid, user.SqlId);
-                        if (unsyncedTasks > 0) errors.Add("tarefas");
-
-                        var unsyncedMessages = await _firebaseService.GetUnsyncedMessagesForDriverCountAsync(user.Uid);
-                        if (unsyncedMessages > 0) errors.Add("mensagens");
-
-                        var unsyncedRefuels = await _firebaseService.GetUnsyncedRefuelsForDriverCountAsync(user.Uid);
-                        if (unsyncedRefuels > 0) errors.Add("abastecimento");
-
-                        var unsyncedIncidents = await _firebaseService.GetUnsyncedIncidentsForDriverCountAsync(user.Uid);
-                        if (unsyncedIncidents > 0) errors.Add("incidente");
-
-                        string syncErrorText = "All in sync";
-                        if (errors.Count > 0)
+                        var fbUsers = await _firebaseService.GetAuthorizedDriversAsync();
+                        foreach (var user in fbUsers)
                         {
-                            syncErrorText = "Falta sincronizar " + string.Join(", ", errors);
-                        }
+                            var errors = new List<string>();
 
-                        await _firebaseService.UpdateDriverSyncErrorAsync(user.Uid, syncErrorText);
+                            var unsyncedTasks = await _firebaseService.GetUnsyncedTasksForDriverCountAsync(user.Uid, user.SqlId);
+                            if (unsyncedTasks > 0) errors.Add("tarefas");
+
+                            var unsyncedMessages = await _firebaseService.GetUnsyncedMessagesForDriverCountAsync(user.Uid);
+                            if (unsyncedMessages > 0) errors.Add("mensagens");
+
+                            var unsyncedRefuels = await _firebaseService.GetUnsyncedRefuelsForDriverCountAsync(user.Uid);
+                            if (unsyncedRefuels > 0) errors.Add("abastecimento");
+
+                            var unsyncedIncidents = await _firebaseService.GetUnsyncedIncidentsForDriverCountAsync(user.Uid);
+                            if (unsyncedIncidents > 0) errors.Add("incidente");
+
+                            string syncErrorText = "All in sync";
+                            if (errors.Count > 0)
+                            {
+                                syncErrorText = "Falta sincronizar " + string.Join(", ", errors);
+                            }
+
+                            // Apenas atualiza o Firebase se o estado do erro tiver mudado
+                            if (user.SyncError != syncErrorText)
+                            {
+                                await _firebaseService.UpdateDriverSyncErrorAsync(user.Uid, syncErrorText);
+                                user.SyncError = syncErrorText; // Atualiza em memória
+                                _logger.LogInformation("Estado de sincronização do motorista {NickName} atualizado para: {Status}", user.Nickname, syncErrorText);
+                            }
+                        }
+                        _lastSyncErrorCalculationTime = DateTime.UtcNow;
                     }
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Erro ao atualizar estado de sincronização dos motoristas.");
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Erro ao atualizar estado de sincronização dos motoristas.");
+                    }
                 }
 
                 // D. Cleanup semanal de segundas-feiras às 00:00 UTC
